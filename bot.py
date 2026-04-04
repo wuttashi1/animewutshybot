@@ -1,6 +1,6 @@
 """
-Discord bot: форум YummyAnime (/animeadd), MAL, оценки, рекомендации, /myanimelist, /update_topics.
-Токен: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID — иначе глобальные slash-команды дублировались бы с гильдейскими.
+Discord bot: YummyAnime форум (/animeadd, /aa, текст !aa), /animelist (ветки), /myanimelist (MAL), /update_topics.
+Справочная ветка: BOT_INFO_THREAD_ID. Токен: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from discord import app_commands
 from discord.ext import commands
 
 FORUM_CHANNEL_ID = 1393418241468141580
+# Ветка форума со справкой и списком команд (редактируйте сообщения там вручную при необходимости).
+BOT_INFO_THREAD_ID = 1490073562122289276
 BASE = "https://en.yummyani.me"
 API_SEARCH = f"{BASE}/api/search"
 API_ANIME = f"{BASE}/api/anime"
@@ -46,6 +49,8 @@ MAL_ANIME_PAGE_RE = re.compile(
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 STATE_PATH = DATA_DIR / "mal_state.json"
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -902,6 +907,8 @@ async def _ingest_forum_thread_from_discord(
     """
     Обновляет anime_topics и threads по первому сообщению темы (ссылка YummyAnime / MAL).
     """
+    if thread.id == BOT_INFO_THREAD_ID:
+        return False
     async with _state_lock:
         raw_info_tid = _load_state().get("meta", {}).get("bot_info_thread_id")
     try:
@@ -1049,6 +1056,8 @@ async def repair_single_forum_thread(
     notes: list[str] = []
     if thread.parent_id != forum.id:
         return notes
+    if thread.id == BOT_INFO_THREAD_ID:
+        return notes
     async with _state_lock:
         raw_info_tid = _load_state().get("meta", {}).get("bot_info_thread_id")
     try:
@@ -1094,17 +1103,18 @@ async def repair_single_forum_thread(
 def _build_bot_commands_embed() -> discord.Embed:
     e = discord.Embed(
         title="📌 YummyAnime-бот — команды",
-        description="Все slash-команды ниже. Используйте их на **этом сервере**.",
+        description="Все slash-команды ниже. Можно также писать в чат: `!aa запрос`, `!animeadd запрос`, `/aa запрос` (как текст).",
         color=EMBED_COLOR,
     )
     rows = [
-        ("`/animeadd`", "Добавить аниме с YummyAnime в форум (ссылка или поиск). Повторное добавление того же тайтла дописывает вас в «Добавили»."),
+        ("`/animeadd` и **`/aa`**", "Добавить аниме с YummyAnime в форум (ссылка или поиск). То же, что `/aa`."),
+        ("`/animelist`", "Аниме, которые пользователь **добавил в ветки форума** на сервере (не сайт MAL)."),
+        ("`/myanimelist`", "Список с **сайта MyAnimeList** (нужна привязка `/connectmyanimelist`). По умолчанию — ваш ник."),
+        ("`/checkanimelist`", "То же, что MAL-список, но участник **обязателен** в параметре."),
         ("`/connectmyanimelist`", "Привязать MAL и создать темы из списка (ещё не импортированные)."),
-        ("`/checkanimelist`", "Показать список с сайта MyAnimeList у привязанного пользователя."),
-        ("`/myanimelist`", "Список аниме, которые пользователь **добавил на сервер** в топики форума (после синхронизации с форумом)."),
-        ("`/rateanime`", "Оценка 1–10 внутри темы форума (или кнопка «Оценить» под постом)."),
-        ("`/checkduplicates`", "Найти дубликаты тем (одно аниме — несколько веток) и удалить лишние."),
-        ("`/update_topics`", "**Только админы:** обновить старые темы — реакции, панели оценок/рекомендаций, при возможности карточку YummyAnime."),
+        ("`/rateanime`", "Оценка 1–10 внутри темы форума (или кнопка «Оценить»)."),
+        ("`/checkduplicates`", "Дубликаты тем (одно аниме — несколько веток) и удаление лишних."),
+        ("`/update_topics`", "**Только админы:** догнать старые темы — реакции, панели, карточку YummyAnime."),
     ]
     for name, desc in rows:
         e.add_field(name=name, value=desc, inline=False)
@@ -1113,46 +1123,25 @@ def _build_bot_commands_embed() -> discord.Embed:
 
 
 async def ensure_bot_info_thread(client: discord.Client) -> None:
-    forum = await resolve_forum_channel(client)
-    if not forum:
-        return
+    """Фиксированная ветка справки: BOT_INFO_THREAD_ID (редактируйте посты там вручную)."""
     async with _state_lock:
         data = _load_state()
-        meta = data.setdefault("meta", {})
-        raw_id = meta.get("bot_info_thread_id")
-        try:
-            existing_id = int(raw_id) if raw_id is not None else None
-        except (TypeError, ValueError):
-            existing_id = None
-    if existing_id:
-        ch = client.get_channel(existing_id)
-        if ch is None:
-            try:
-                ch = await client.fetch_channel(existing_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                ch = None
-        if isinstance(ch, discord.Thread) and not ch.archived:
-            return
-    embed = _build_bot_commands_embed()
-    try:
-        twm = await forum.create_thread(
-            name="📌 Команды бота и справка",
-            embeds=[embed],
-            content="Закрепите это сообщение (📌), чтобы быстро находить список команд.",
-        )
-        th = twm.thread
-        msg = twm.message
-    except discord.HTTPException as e:
-        logger.warning("Не удалось создать справочную тему: %s", e)
-        return
-    try:
-        await msg.pin()
-    except discord.HTTPException:
-        logger.info("Не удалось закрепить сообщение в справочной теме (права).")
-    async with _state_lock:
-        data = _load_state()
-        data.setdefault("meta", {})["bot_info_thread_id"] = th.id
+        data.setdefault("meta", {})["bot_info_thread_id"] = BOT_INFO_THREAD_ID
         _write_state(data)
+    ch = client.get_channel(BOT_INFO_THREAD_ID)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(BOT_INFO_THREAD_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            ch = None
+    if not isinstance(ch, discord.Thread):
+        logger.warning(
+            "Справочная ветка %s не найдена — создайте её или проверьте ID и права бота.",
+            BOT_INFO_THREAD_ID,
+        )
+        return
+    if ch.archived:
+        logger.info("Справочная ветка %s в архиве — разархивируйте при необходимости.", BOT_INFO_THREAD_ID)
 
 
 async def resolve_forum_channel(client: discord.Client) -> discord.ForumChannel | None:
@@ -1599,6 +1588,9 @@ class DuplicateCleanupView(discord.ui.View):
 class YummyBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
+        # Для !aa / !animeadd в чате включите в Portal «Message Content Intent» и оставьте 1 (по умолчанию).
+        _mc = (os.environ.get("DISCORD_MESSAGE_CONTENT_INTENT") or "1").strip().lower()
+        intents.message_content = _mc not in ("0", "false", "no", "off")
         super().__init__(command_prefix="!", intents=intents)
         self.session: aiohttp.ClientSession | None = None
 
@@ -1662,6 +1654,145 @@ class YummyBot(commands.Bot):
 
 bot = YummyBot()
 
+TEXT_ANIMEADD_RE = re.compile(
+    r"^(?:!aa|!animeadd|/aa|/animeadd)\s+(.+)$",
+    re.I | re.DOTALL,
+)
+
+
+async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) -> str:
+    """Текст ответа для slash или сообщения в чате."""
+    if not bot.session:
+        return "Сессия HTTP не готова."
+    q = query.strip()
+    if not q:
+        return "Пустой запрос."
+    slug = slug_from_text(q)
+    if not slug:
+        slug = await api_search_slug(bot.session, q)
+    if not slug:
+        return "Не нашёл аниме. Уточните запрос или вставьте ссылку с en.yummyani.me."
+    info = await api_fetch_anime(bot.session, slug)
+    if not info:
+        return "Не удалось загрузить карточку аниме (API вернул ошибку)."
+    ch = await resolve_forum_channel(bot)
+    if not ch:
+        return "Канал форума не найден или бот не видит его. Проверьте ID и права бота."
+    slug_key = _clean_slug((info.get("anime_url") or slug or "").strip())
+    thread, merge_st = await merge_adder_into_existing_topic(bot, slug_key, user_id)
+    if merge_st == "merged":
+        link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
+        return f"Тема уже была — добавил вас в подпись: {link}"
+    if merge_st == "already":
+        link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
+        return f"Эта тема уже есть, вы уже среди добавивших: {link}"
+    if merge_st in ("edit_failed", "fetch_failed"):
+        return (
+            "Тема с этим аниме уже есть в базе бота, но не удалось обновить сообщение "
+            "(права или тема удалена). Обратитесь к администратору."
+        )
+    thread, _starter, err = await create_yummy_forum_thread(
+        ch, bot.session, info, user_id, mal_id=None, resolved_slug=slug
+    )
+    if err or not thread:
+        return err or "Не удалось создать тему."
+    link = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
+    return f"Готово: {link}"
+
+
+async def build_mal_list_embed_for_member(
+    session: aiohttp.ClientSession,
+    state: dict[str, Any],
+    member: discord.Member,
+) -> tuple[discord.Embed | None, str | None]:
+    """Список MAL с сайта. (embed, err_text)."""
+    acc = state.get("mal_accounts", {}).get(str(member.id))
+    if not isinstance(acc, dict):
+        return None, f"{member.mention} ещё не привязал список MAL (`/connectmyanimelist`)."
+    username = (acc.get("username") or "").strip()
+    list_url = (acc.get("list_url") or "").strip()
+    if not username:
+        return None, "В сохранённой привязке нет имени пользователя MAL."
+    entries, http_st = await mal_fetch_full_list(session, username, MAL_STATUS_ALL)
+    if http_st != 200:
+        return None, "Не удалось загрузить список с MyAnimeList (список закрыт или MAL недоступен)."
+    by_status: dict[int, list[str]] = {}
+    for e in entries:
+        st = e.get("status")
+        try:
+            sk = int(st) if st is not None else 0
+        except (TypeError, ValueError):
+            sk = 0
+        line = _format_mal_entry_line(e)
+        by_status.setdefault(sk, []).append(line)
+    embed = discord.Embed(
+        title=f"MyAnimeList — {member.display_name}",
+        url=list_url or f"https://myanimelist.net/animelist/{username}",
+        color=0x2E51A2,
+        description=f"**MAL:** [{username}]({list_url or f'https://myanimelist.net/animelist/{username}'}) · "
+        f"записей: **{len(entries)}**",
+    )
+    order = (1, 6, 2, 3, 4)
+    for sk in order:
+        lines = by_status.get(sk, [])
+        if not lines:
+            continue
+        name = MAL_STATUS_NAMES.get(sk, "Другое")
+        chunk = lines[:35]
+        val = "\n".join(chunk)
+        if len(lines) > 35:
+            val += f"\n_…и ещё {len(lines) - 35}_"
+        embed.add_field(
+            name=f"{name} ({len(lines)})",
+            value=_truncate(val, EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+    leftover = [sk for sk in sorted(by_status.keys()) if sk not in order and by_status[sk]]
+    for sk in leftover:
+        lines = by_status[sk]
+        val = "\n".join(lines[:20])
+        if len(lines) > 20:
+            val += f"\n_…и ещё {len(lines) - 20}_"
+        embed.add_field(
+            name=f"Статус {sk} ({len(lines)})",
+            value=_truncate(val, EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+    return embed, None
+
+
+async def run_animelist_discord_topics(
+    guild: discord.Guild, target: discord.Member
+) -> tuple[discord.Embed | None, str | None, int, int]:
+    """Аниме из веток форума по adders. (embed, err, scanned, updated)."""
+    scanned, updated = await sync_forum_threads_with_state(
+        bot, guild, bot.session if bot.session else None
+    )
+    state = await read_state_copy()
+    pairs = list_discord_added_anime_for_user(state, guild.id, target.id)
+    if not pairs:
+        return (
+            None,
+            f"{target.mention} пока не числится среди добавивших ни в одной теме форума "
+            f"(или темы не удалось разобрать). Просмотрено веток: **{scanned}**, "
+            f"обновлено записей: **{updated}**.",
+            scanned,
+            updated,
+        )
+    lines = [f"• [{t}]({u})" for t, u in pairs[:60]]
+    body = "\n".join(lines)
+    if len(pairs) > 60:
+        body += f"\n_…и ещё {len(pairs) - 60}_"
+    embed = discord.Embed(
+        title=f"Добавлено в Discord — {target.display_name}",
+        description=_truncate(body, EMBED_DESC_LIMIT),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(
+        text=f"Форум синхронизирован: веток {scanned}, записей обновлено {updated}"
+    )
+    return embed, None, scanned, updated
+
 
 @bot.event
 async def on_ready() -> None:
@@ -1678,6 +1809,33 @@ async def on_disconnect() -> None:
     logger.warning("Соединение с Discord разорвано (on_disconnect).")
 
 
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
+    raw = (message.content or "").strip()
+    m = TEXT_ANIMEADD_RE.match(raw)
+    if not m:
+        await bot.process_commands(message)
+        return
+    query = (m.group(1) or "").strip()
+    if not query:
+        await message.channel.send(
+            "Укажите ссылку или название: `!aa название` или `!animeadd ссылка`",
+            reference=message,
+            mention_author=False,
+        )
+        return
+    async with message.channel.typing():
+        try:
+            out = await run_animeadd_for_user(message.guild, message.author.id, query)
+        except Exception:
+            logger.exception("Текстовый animeadd")
+            out = "Произошла ошибка при добавлении. Попробуйте `/animeadd`."
+    await message.reply(_truncate(out, DISCORD_CONTENT_LIMIT), mention_author=False)
+
+
 @bot.tree.command(name="animeadd", description="Добавить аниме с YummyAnime в форум (ссылка или название)")
 @app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
 async def animeadd(interaction: discord.Interaction, query: str) -> None:
@@ -1686,71 +1844,22 @@ async def animeadd(interaction: discord.Interaction, query: str) -> None:
             "Команду можно использовать только на сервере.", ephemeral=True
         )
         return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
+    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
+    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
 
-    if not bot.session:
-        await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
-        return
 
-    slug = slug_from_text(query)
-    if not slug:
-        slug = await api_search_slug(bot.session, query)
-    if not slug:
-        await interaction.followup.send(
-            "Не нашёл аниме. Уточните запрос или вставьте прямую ссылку с en.yummyani.me.",
-            ephemeral=True,
+@bot.tree.command(name="aa", description="Короткий алиас /animeadd — добавить аниме в форум")
+@app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
+async def aa(interaction: discord.Interaction, query: str) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
         )
         return
-
-    info = await api_fetch_anime(bot.session, slug)
-    if not info:
-        await interaction.followup.send(
-            "Не удалось загрузить карточку аниме (API вернул ошибку).",
-            ephemeral=True,
-        )
-        return
-
-    ch = await resolve_forum_channel(bot)
-    if not ch:
-        await interaction.followup.send(
-            "Канал форума не найден или бот не видит его. Проверьте ID и права бота.",
-            ephemeral=True,
-        )
-        return
-
-    slug_key = _clean_slug((info.get("anime_url") or slug or "").strip())
-    uid = interaction.user.id
-    thread, merge_st = await merge_adder_into_existing_topic(bot, slug_key, uid)
-    if merge_st == "merged":
-        link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
-        await interaction.followup.send(
-            f"Тема уже была — добавил вас в подпись: {link}", ephemeral=True
-        )
-        return
-    if merge_st == "already":
-        link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
-        await interaction.followup.send(
-            f"Эта тема уже есть, вы уже среди добавивших: {link}", ephemeral=True
-        )
-        return
-    if merge_st in ("edit_failed", "fetch_failed"):
-        await interaction.followup.send(
-            "Тема с этим аниме уже есть в базе бота, но не удалось обновить "
-            "сообщение (права или тема удалена). Обратитесь к администратору.",
-            ephemeral=True,
-        )
-        return
-
-    thread, _starter, err = await create_yummy_forum_thread(
-        ch, bot.session, info, uid, mal_id=None, resolved_slug=slug
-    )
-    if err or not thread:
-        await interaction.followup.send(err or "Не удалось создать тему.", ephemeral=True)
-        return
-
-    link = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
-    await interaction.followup.send(f"Готово: {link}", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
+    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
 
 
 def _mal_choice_to_status(choice: str) -> int:
@@ -2034,7 +2143,7 @@ async def rateanime(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="checkanimelist",
-    description="Показать привязанный список MyAnimeList пользователя",
+    description="Показать привязанный список MyAnimeList пользователя (с сайта MAL)",
 )
 @app_commands.describe(member="Чей список показать")
 async def checkanimelist(interaction: discord.Interaction, member: discord.Member) -> None:
@@ -2051,118 +2160,78 @@ async def checkanimelist(interaction: discord.Interaction, member: discord.Membe
         return
 
     await interaction.response.defer(thinking=True)
-
     state = await read_state_copy()
-    acc = state.get("mal_accounts", {}).get(str(member.id))
-    if not isinstance(acc, dict):
-        await interaction.followup.send(
-            f"{member.mention} ещё не привязал список MAL (`/connectmyanimelist`)."
-        )
+    embed, err = await build_mal_list_embed_for_member(bot.session, state, member)
+    if err:
+        await interaction.followup.send(err)
         return
-
-    username = (acc.get("username") or "").strip()
-    list_url = (acc.get("list_url") or "").strip()
-    if not username:
-        await interaction.followup.send("В сохранённой привязке нет имени пользователя MAL.")
-        return
-
-    entries, http_st = await mal_fetch_full_list(bot.session, username, MAL_STATUS_ALL)
-    if http_st != 200:
-        await interaction.followup.send(
-            "Не удалось загрузить список с MyAnimeList (список закрыт или MAL недоступен)."
-        )
-        return
-
-    by_status: dict[int, list[str]] = {}
-    for e in entries:
-        st = e.get("status")
-        try:
-            sk = int(st) if st is not None else 0
-        except (TypeError, ValueError):
-            sk = 0
-        line = _format_mal_entry_line(e)
-        by_status.setdefault(sk, []).append(line)
-
-    embed = discord.Embed(
-        title=f"Список аниме — {member.display_name}",
-        url=list_url or f"https://myanimelist.net/animelist/{username}",
-        color=0x2E51A2,
-        description=f"**MAL:** [{username}]({list_url or f'https://myanimelist.net/animelist/{username}'}) · "
-        f"записей: **{len(entries)}**",
-    )
-
-    order = (1, 6, 2, 3, 4)
-    for sk in order:
-        lines = by_status.get(sk, [])
-        if not lines:
-            continue
-        name = MAL_STATUS_NAMES.get(sk, "Другое")
-        chunk = lines[:35]
-        val = "\n".join(chunk)
-        if len(lines) > 35:
-            val += f"\n_…и ещё {len(lines) - 35}_"
-        embed.add_field(
-            name=f"{name} ({len(lines)})",
-            value=_truncate(val, EMBED_FIELD_LIMIT),
-            inline=False,
-        )
-
-    leftover = [sk for sk in sorted(by_status.keys()) if sk not in order and by_status[sk]]
-    for sk in leftover:
-        lines = by_status[sk]
-        val = "\n".join(lines[:20])
-        if len(lines) > 20:
-            val += f"\n_…и ещё {len(lines) - 20}_"
-        embed.add_field(
-            name=f"Статус {sk} ({len(lines)})",
-            value=_truncate(val, EMBED_FIELD_LIMIT),
-            inline=False,
-        )
-
+    assert embed is not None
     await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(
     name="myanimelist",
-    description="Аниме, добавленные пользователем в топики форума на этом сервере (с синхронизацией форума)",
+    description="Список с сайта MyAnimeList (нужна привязка /connectmyanimelist). По умолчанию — ваш аккаунт",
 )
-@app_commands.describe(member="Чей список (если не указано — ваш)")
+@app_commands.describe(member="Чей список MAL (необязательно)")
 async def myanimelist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
         )
         return
-
-    target = member or interaction.user
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    scanned, updated = await sync_forum_threads_with_state(
-        bot, interaction.guild, bot.session if bot.session else None
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    raw_target = member or interaction.user
+    target = (
+        raw_target
+        if isinstance(raw_target, discord.Member)
+        else interaction.guild.get_member(raw_target.id)
     )
-    state = await read_state_copy()
-    pairs = list_discord_added_anime_for_user(state, interaction.guild.id, target.id)
-    if not pairs:
-        await interaction.followup.send(
-            f"{target.mention} пока не числится среди добавивших ни в одной теме форума "
-            f"(или темы не удалось разобрать). Просмотрено веток: **{scanned}**, "
-            f"обновлено записей в базе: **{updated}**.",
-            ephemeral=True,
+    if target is None:
+        await interaction.response.send_message(
+            "Укажите участника этого сервера.", ephemeral=True
         )
         return
+    await interaction.response.defer(thinking=True)
+    state = await read_state_copy()
+    embed, err = await build_mal_list_embed_for_member(bot.session, state, target)
+    if err:
+        await interaction.followup.send(err)
+        return
+    assert embed is not None
+    await interaction.followup.send(embed=embed)
 
-    lines = [f"• [{t}]({u})" for t, u in pairs[:60]]
-    body = "\n".join(lines)
-    if len(pairs) > 60:
-        body += f"\n_…и ещё {len(pairs) - 60}_"
-    embed = discord.Embed(
-        title=f"Добавлено в Discord — {target.display_name}",
-        description=_truncate(body, EMBED_DESC_LIMIT),
-        color=EMBED_COLOR,
+
+@bot.tree.command(
+    name="animelist",
+    description="Аниме, которые пользователь добавлял в ветки форума на сервере (не список с MyAnimeList)",
+)
+@app_commands.describe(member="Чей список (если не указано — ваш)")
+async def animelist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    raw_target = member or interaction.user
+    target = (
+        raw_target
+        if isinstance(raw_target, discord.Member)
+        else interaction.guild.get_member(raw_target.id)
     )
-    embed.set_footer(
-        text=f"Форум синхронизирован: веток {scanned}, записей обновлено {updated}"
-    )
+    if target is None:
+        await interaction.response.send_message(
+            "Укажите участника этого сервера.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    embed, err, _s, _u = await run_animelist_discord_topics(interaction.guild, target)
+    if err:
+        await interaction.followup.send(_truncate(err, DISCORD_CONTENT_LIMIT), ephemeral=True)
+        return
+    assert embed is not None
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2293,6 +2362,15 @@ async def checkduplicates(interaction: discord.Interaction) -> None:
     )
 
 
+def _normalize_discord_token(raw: str | None) -> str:
+    if not raw:
+        return ""
+    t = str(raw).strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+        t = t[1:-1].strip()
+    return t
+
+
 def main() -> None:
     load_dotenv()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -2300,17 +2378,53 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.StreamHandler(),
+            logging.StreamHandler(stream=sys.stdout),
             logging.FileHandler(
                 DATA_DIR / "bot.log", encoding="utf-8", mode="a"
             ),
         ],
         force=True,
     )
-    token = os.environ.get("DISCORD_BOT_TOKEN")
+    token = _normalize_discord_token(os.environ.get("DISCORD_BOT_TOKEN"))
     if not token:
-        raise SystemExit("Задайте переменную окружения DISCORD_BOT_TOKEN.")
-    bot.run(token)
+        err = (
+            "Ошибка: не задан DISCORD_BOT_TOKEN.\n"
+            "Добавьте строку в файл .env рядом с bot.py:\n"
+            "  DISCORD_BOT_TOKEN=ваш_токен\n"
+            "Токен: Discord Developer Portal → ваше приложение → Bot → Reset Token / скопировать."
+        )
+        print(err, file=sys.stderr)
+        raise SystemExit(1)
+    if len(token) < 50:
+        print(
+            "Предупреждение: токен выглядит слишком коротким. Проверьте, что в .env нет лишних пробелов и кавычек.",
+            file=sys.stderr,
+        )
+
+    try:
+        bot.run(token)
+    except discord.LoginFailure:
+        print(
+            "\n=== Вход не удался (неверный или отозванный токен) ===\n"
+            "Создайте новый токен: https://discord.com/developers/applications\n"
+            "→ ваше приложение → Bot → Reset Token, вставьте в .env как DISCORD_BOT_TOKEN=...\n"
+            "Подробности в файле data/bot.log\n",
+            file=sys.stderr,
+        )
+        logger.exception("LoginFailure")
+        raise SystemExit(1) from None
+    except discord.HTTPException as e:
+        if e.status == 429:
+            print(
+                "\n=== Discord: 429 Too Many Requests ===\n"
+                "Слишком много попыток входа с этого IP (частые перезапуски на хостинге).\n"
+                "Подождите 15–60 минут, уменьшите частоту рестартов, смените IP/хостинг при необходимости.\n",
+                file=sys.stderr,
+            )
+        else:
+            print(f"\n=== Ошибка HTTP Discord: {e.status} ===\n{e}\n", file=sys.stderr)
+        logger.exception("HTTPException при запуске")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
