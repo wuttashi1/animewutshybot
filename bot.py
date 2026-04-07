@@ -1315,6 +1315,58 @@ async def apply_personal_list_permissions(
             pass
 
 
+async def _get_list_thread_starter_message(thread: discord.Thread) -> discord.Message | None:
+    starter = thread.starter_message
+    if starter is not None:
+        return starter
+    try:
+        async for m in thread.history(limit=1, oldest_first=True):
+            return m
+    except discord.HTTPException:
+        return None
+    return None
+
+
+def _owner_id_from_list_starter_message(message: discord.Message | None) -> int | None:
+    """Владелец личного списка — первое не-бот упоминание в стартовом сообщении темы."""
+    if message is None:
+        return None
+    for u in message.mentions:
+        if not u.bot:
+            return u.id
+    for m in re.finditer(r"<@!?(\d+)>", message.content or ""):
+        try:
+            uid = int(m.group(1))
+        except ValueError:
+            continue
+        if uid > 0:
+            return uid
+    return None
+
+
+async def persist_personal_thread_binding(
+    owner_id: int,
+    thread: discord.Thread,
+    starter: discord.Message | None,
+) -> None:
+    """Сохраняет thread_id и starter_message_id для личного списка (привязка темы)."""
+    async with _state_lock:
+        data = _load_state()
+        uid = str(owner_id)
+        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        pl["thread_id"] = thread.id
+        if starter is not None:
+            pl["starter_message_id"] = starter.id
+        pl.setdefault("anime_messages", {})
+        pl.setdefault("order", [])
+        pl.setdefault("top5", [])
+        pl.setdefault("accent_color", EMBED_COLOR)
+        pl.setdefault("show_numbers", False)
+        pl.setdefault("compact_cards", False)
+        data["personal_lists"][uid] = pl
+        _write_state(data)
+
+
 PERSONAL_ACCENT_PALETTE: tuple[int, ...] = (
     0xE67E22,
     0x9B59B6,
@@ -1327,6 +1379,64 @@ PERSONAL_ACCENT_PALETTE: tuple[int, ...] = (
 )
 
 
+async def resolve_personal_list_owner_for_interaction(
+    interaction: discord.Interaction,
+) -> tuple[int, dict[str, Any]] | None:
+    """
+    Владелец темы из state или авто-привязка по @ в первом сообщении темы (форум личных списков).
+    При ошибках отправляет ephemeral и возвращает None.
+    """
+    ch = interaction.channel
+    if not isinstance(ch, discord.Thread):
+        await interaction.response.send_message(
+            "Панель работает только в **личной теме** списка.", ephemeral=True
+        )
+        return None
+    if ch.parent_id != LIST_FORUM_CHANNEL_ID:
+        await interaction.response.send_message(
+            "Это не форум **личных списков**. Откройте свою тему там, где канал личных списков "
+            f"(id `{LIST_FORUM_CHANNEL_ID}`), а не основной форум с аниме.",
+            ephemeral=True,
+        )
+        return None
+
+    state = await read_state_copy()
+    oid = _list_owner_id_by_thread_id(state, ch.id)
+    if oid is not None:
+        pl = (state.get("personal_lists") or {}).get(str(oid))
+        if isinstance(pl, dict):
+            return oid, pl
+        await interaction.response.send_message("Нет данных списка.", ephemeral=True)
+        return None
+
+    starter = await _get_list_thread_starter_message(ch)
+    inferred = _owner_id_from_list_starter_message(starter)
+    if inferred is None:
+        await interaction.response.send_message(
+            "Тема не была в базе бота. В **самом первом** сообщении темы должен быть **ваш @ник** "
+            "(как когда бот создаёт тему: «@вы — личный список…»). "
+            "Добавьте себя в начало первого поста и снова нажмите кнопку или **Синхронизировать**.",
+            ephemeral=True,
+        )
+        return None
+    if interaction.user.id != inferred:
+        await interaction.response.send_message(
+            f"По первому сообщению тема для <@{inferred}>. Войдите с того аккаунта или попросите владельца.",
+            ephemeral=True,
+        )
+        return None
+
+    await persist_personal_thread_binding(inferred, ch, starter)
+    state2 = await read_state_copy()
+    pl2 = (state2.get("personal_lists") or {}).get(str(inferred))
+    if not isinstance(pl2, dict):
+        await interaction.response.send_message(
+            "Не удалось сохранить привязку темы.", ephemeral=True
+        )
+        return None
+    return inferred, pl2
+
+
 class PersonalTopicHubView(discord.ui.View):
     """Постоянные кнопки панели (custom_id фиксированы — работают после перезапуска бота)."""
 
@@ -1336,24 +1446,7 @@ class PersonalTopicHubView(discord.ui.View):
     async def _resolve_owner(
         self, interaction: discord.Interaction
     ) -> tuple[int, dict[str, Any]] | None:
-        ch = interaction.channel
-        if not isinstance(ch, discord.Thread):
-            await interaction.response.send_message(
-                "Панель работает только в **личной теме** списка.", ephemeral=True
-            )
-            return None
-        state = await read_state_copy()
-        oid = _list_owner_id_by_thread_id(state, ch.id)
-        if oid is None:
-            await interaction.response.send_message(
-                "Эта тема не привязана к личному списку.", ephemeral=True
-            )
-            return None
-        pl = (state.get("personal_lists") or {}).get(str(oid))
-        if not isinstance(pl, dict):
-            await interaction.response.send_message("Нет данных списка.", ephemeral=True)
-            return None
-        return oid, pl
+        return await resolve_personal_list_owner_for_interaction(interaction)
 
     @discord.ui.button(
         label="Обновить",
@@ -1541,11 +1634,71 @@ class PersonalTopicHubView(discord.ui.View):
             "· **Ваша оценка** — из панели «Оценить» в **теме этого аниме** на основном форуме.\n"
             "· `/settopanime` — закрепить топ-5 (звезда на карточке).\n"
             "· `/editmyanimelist` — название темы и первый пост.\n"
-            "· **Экспорт** — Markdown-список с ссылками (только вам, для профилей и заметок).\n"
-            "· `/mytopicpanel` — восстановить панель, если сломалась после обновления бота.\n"
+            "· **Синхронизировать** — как `/syncanimelist` для вас: парсинг основного форума + список в теме.\n"
+            "· **Экспорт** — Markdown-список с ссылками (только вам).\n"
+            "· `/mytopicpanel` — восстановить панель после сбоев.\n"
             "· Jikan — публичный API; при лимитах постер MAL может не подгрузиться.\n"
         )
         await interaction.response.send_message(text, ephemeral=True)
+
+    @discord.ui.button(
+        label="Синхронизировать",
+        style=discord.ButtonStyle.success,
+        emoji="🔗",
+        custom_id="plist:hub:sync",
+        row=2,
+    )
+    async def hub_sync(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        resolved = await self._resolve_owner(interaction)
+        if not resolved:
+            return
+        owner_id, _pl = resolved
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message(
+                "Синхронизация только для **владельца** списка.", ephemeral=True
+            )
+            return
+        if not interaction.guild:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        client = interaction.client
+        sess = getattr(client, "session", None)
+        try:
+            scanned, updated = await sync_forum_threads_with_state(
+                client, interaction.guild, sess
+            )
+        except Exception:
+            logger.exception("plist hub sync forum")
+            await interaction.followup.send(
+                "Ошибка при обходе основного форума.", ephemeral=True
+            )
+            return
+        n, err = await sync_personal_list_from_anime_topics(
+            interaction.guild, owner_id
+        )
+        try:
+            await rebuild_personal_list_display(
+                client, interaction.guild.id, owner_id, session=sess
+            )
+        except Exception:
+            logger.exception("plist hub sync rebuild")
+            await interaction.followup.send(
+                "Список обновлён в базе, но не удалось пересобрать карточки. Нажми **Обновить**.",
+                ephemeral=True,
+            )
+            return
+        parts = [
+            f"**Основной форум:** просмотрено веток **{scanned}**, записей **{updated}**.",
+            f"**Ваш личный список:** **{n}** позиций, карточки пересобраны.",
+        ]
+        if err:
+            parts.append(str(err))
+        await interaction.followup.send(
+            _truncate("\n".join(parts), DISCORD_CONTENT_LIMIT),
+            ephemeral=True,
+        )
 
     @discord.ui.button(
         label="Экспорт",
@@ -1738,11 +1891,12 @@ def _personal_hub_embed(pl: dict[str, Any], display_name: str) -> discord.Embed:
         title="🎛️ Панель топика",
         description=(
             f"**{display_name}** — настройки и действия.\n\n"
-            "· **Обновить** — пересобрать все карточки (постеры и оценки).\n"
+            "· **Синхронизировать** — обход **основного** форума аниме + пересбор вашего списка и карточек.\n"
+            "· **Обновить** — только пересобрать карточки из уже сохранённых данных.\n"
             "· **Тема** — цвет карточек.\n"
             "· **# Нумерация** — порядковые номера в заголовках.\n"
             "· **Компакт** — короткий вид карточек.\n"
-            "· **Статистика** / **Справка** / **Экспорт** — сводка и Markdown-список для копирования.\n\n"
+            "· **Статистика** / **Справка** / **Экспорт** — сводка и Markdown.\n\n"
             f"_Сейчас: нумерация **{nums}**, компакт **{comp}**._"
         ),
         color=accent,
@@ -3421,16 +3575,15 @@ async def mytopicpanel(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    state = await read_state_copy()
-    oid = _list_owner_id_by_thread_id(state, ch.id)
-    if oid is None or oid != interaction.user.id:
-        await interaction.response.send_message(
-            "Это не ваша личная тема или список не привязан.", ephemeral=True
-        )
+    resolved = await resolve_personal_list_owner_for_interaction(interaction)
+    if not resolved:
         return
-    pl = (state.get("personal_lists") or {}).get(str(oid))
-    if not isinstance(pl, dict):
-        await interaction.response.send_message("Нет данных списка.", ephemeral=True)
+    oid, pl = resolved
+    if oid != interaction.user.id:
+        await interaction.response.send_message(
+            f"Эта тема в базе за <@{oid}>. Войдите с того аккаунта.",
+            ephemeral=True,
+        )
         return
     cid = pl.get("control_message_id")
     if cid:
