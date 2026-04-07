@@ -1,5 +1,6 @@
 """
-Discord bot: YummyAnime форум (/animeadd, /aa, текст !aa), /animelist (ветки), /myanimelist (MAL), /update_topics.
+Discord bot: YummyAnime основной форум (/animeadd), личные списки в LIST_FORUM_CHANNEL_ID,
+/animelist и /checkanime по сохранённым данным, /myanimelist (MAL), /update_topics.
 Справочная ветка: BOT_INFO_THREAD_ID. Токен: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
 """
 
@@ -25,6 +26,8 @@ from discord import app_commands
 from discord.ext import commands
 
 FORUM_CHANNEL_ID = 1393418241468141580
+# Форум «личные списки»: по одной теме на пользователя (зеркало добавлений из основного форума).
+LIST_FORUM_CHANNEL_ID = 1491208484245602385
 # Ветка форума со справкой и списком команд (редактируйте сообщения там вручную при необходимости).
 BOT_INFO_THREAD_ID = 1490073562122289276
 BASE = "https://en.yummyani.me"
@@ -441,6 +444,8 @@ def _default_state() -> dict[str, Any]:
         "ratings": {},
         "imported_mal": {},
         "anime_topics": {},
+        "personal_lists": {},
+        "slug_titles": {},
         "meta": {"bot_info_thread_id": None},
     }
 
@@ -456,7 +461,16 @@ def _load_state() -> dict[str, Any]:
         return _default_state()
     if not isinstance(data, dict):
         return _default_state()
-    for key in ("mal_accounts", "threads", "ratings", "imported_mal", "anime_topics", "meta"):
+    for key in (
+        "mal_accounts",
+        "threads",
+        "ratings",
+        "imported_mal",
+        "anime_topics",
+        "personal_lists",
+        "slug_titles",
+        "meta",
+    ):
         if key not in data or not isinstance(data[key], dict):
             data[key] = {}
     if "bot_info_thread_id" not in data.get("meta", {}):
@@ -1107,14 +1121,16 @@ def _build_bot_commands_embed() -> discord.Embed:
         color=EMBED_COLOR,
     )
     rows = [
-        ("`/animeadd` и **`/aa`**", "Добавить аниме с YummyAnime в форум (ссылка или поиск). То же, что `/aa`."),
-        ("`/animelist`", "Аниме, которые пользователь **добавил в ветки форума** на сервере (не сайт MAL)."),
-        ("`/myanimelist`", "Список с **сайта MyAnimeList** (нужна привязка `/connectmyanimelist`). По умолчанию — ваш ник."),
-        ("`/checkanimelist`", "То же, что MAL-список, но участник **обязателен** в параметре."),
-        ("`/connectmyanimelist`", "Привязать MAL и создать темы из списка (ещё не импортированные)."),
-        ("`/rateanime`", "Оценка 1–10 внутри темы форума (или кнопка «Оценить»)."),
-        ("`/checkduplicates`", "Дубликаты тем (одно аниме — несколько веток) и удаление лишних."),
-        ("`/update_topics`", "**Только админы:** догнать старые темы — реакции, панели, карточку YummyAnime."),
+        ("`/animeadd` и **`/aa`**", "Добавить аниме с YummyAnime в **основной** форум (ссылка или поиск)."),
+        ("`/animelist` и **`/checkanime`**", "Личный Discord-список (без обхода всего форума). Тот же источник данных."),
+        ("`/editmyanimelist` / **`/settopanime`**", "Название и первый пост личной темы; топ-5 для блока «Топ»."),
+        ("`/myanimelist`", "Список с **сайта MyAnimeList** (нужна привязка `/connectmyanimelist`)."),
+        ("`/checkanimelist`", "MAL-список с сайта; участник **обязателен** в параметре."),
+        ("`/connectmyanimelist`", "Привязать MAL и создать темы в основном форуме (ещё не импортированные)."),
+        ("`/syncanimelist`", "**Админы:** пересобрать личный список участника из тем основного форума."),
+        ("`/rateanime`", "Оценка 1–10 в теме **основного** форума с аниме (или кнопка «Оценить»)."),
+        ("`/checkduplicates`", "Дубликаты тем основного форума и удаление лишних."),
+        ("`/update_topics`", "**Админы:** догнать старые темы основного форума — реакции, панели, карточку."),
     ]
     for name, desc in rows:
         e.add_field(name=name, value=desc, inline=False)
@@ -1152,6 +1168,425 @@ async def resolve_forum_channel(client: discord.Client) -> discord.ForumChannel 
         except (discord.NotFound, discord.Forbidden):
             return None
     return ch if isinstance(ch, discord.ForumChannel) else None
+
+
+async def resolve_list_forum_channel(client: discord.Client) -> discord.ForumChannel | None:
+    ch = client.get_channel(LIST_FORUM_CHANNEL_ID)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(LIST_FORUM_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden):
+            return None
+    return ch if isinstance(ch, discord.ForumChannel) else None
+
+
+def _title_for_list_key(state: dict[str, Any], key: str) -> str:
+    st = state.get("slug_titles", {})
+    if isinstance(st, dict):
+        t = (st.get(key) or "").strip()
+        if t:
+            return t
+    topics = state.get("anime_topics", {})
+    ent = topics.get(key) if isinstance(topics, dict) else None
+    if isinstance(ent, dict):
+        tid = str(ent.get("thread_id") or "")
+        meta = state.get("threads", {}).get(tid)
+        if isinstance(meta, dict):
+            tt = (meta.get("title") or "").strip()
+            if tt:
+                return tt
+    return key if not str(key).startswith("mal:") else f"MAL {key}"
+
+
+def _jump_for_list_key(state: dict[str, Any], guild_id: int, key: str) -> str:
+    topics = state.get("anime_topics", {})
+    ent = topics.get(key) if isinstance(topics, dict) else None
+    if isinstance(ent, dict):
+        tid = int(ent.get("thread_id") or 0)
+        if tid:
+            return f"https://discord.com/channels/{guild_id}/{tid}"
+    if str(key).startswith("mal:"):
+        rest = key.split(":", 1)[-1]
+        try:
+            mid = int(rest)
+            return f"https://myanimelist.net/anime/{mid}"
+        except ValueError:
+            pass
+    return f"{BASE}/catalog/item/{_clean_slug(key)}"
+
+
+def _ordered_keys_for_personal(pl: dict[str, Any]) -> list[str]:
+    order = pl.get("order")
+    if not isinstance(order, list):
+        order = []
+    top5 = pl.get("top5")
+    if not isinstance(top5, list):
+        top5 = []
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in top5:
+        ks = str(k).strip()
+        if ks and ks in order and ks not in seen:
+            seen.add(ks)
+            out.append(ks)
+    for k in order:
+        ks = str(k).strip()
+        if ks and ks not in seen:
+            seen.add(ks)
+            out.append(ks)
+    return out
+
+
+async def apply_personal_list_permissions(
+    thread: discord.Thread, guild: discord.Guild, owner_id: int
+) -> None:
+    """Только владелец списка и бот могут писать в личной теме."""
+    everyone = guild.default_role
+    over_everyone = discord.PermissionOverwrite(
+        send_messages=False,
+        add_reactions=True,
+        read_message_history=True,
+        view_channel=True,
+    )
+    over_owner = discord.PermissionOverwrite(
+        send_messages=True,
+        add_reactions=True,
+        read_message_history=True,
+        view_channel=True,
+    )
+    me = guild.me
+    if me:
+        over_bot = discord.PermissionOverwrite(
+            send_messages=True,
+            manage_messages=True,
+            embed_links=True,
+            attach_files=True,
+            read_message_history=True,
+            view_channel=True,
+        )
+        try:
+            await thread.set_permissions(me, overwrite=over_bot)
+        except discord.HTTPException:
+            pass
+    try:
+        await thread.set_permissions(everyone, overwrite=over_everyone)
+    except discord.HTTPException:
+        pass
+    owner = guild.get_member(owner_id)
+    if owner:
+        try:
+            await thread.set_permissions(owner, overwrite=over_owner)
+        except discord.HTTPException:
+            pass
+
+
+async def _save_personal_list_slot(
+    user_id: int,
+    *,
+    thread_id: int,
+    starter_message_id: int,
+    list_message_id: int,
+) -> None:
+    async with _state_lock:
+        data = _load_state()
+        uid = str(user_id)
+        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        pl["thread_id"] = thread_id
+        pl["starter_message_id"] = starter_message_id
+        pl["list_message_id"] = list_message_id
+        data["personal_lists"][uid] = pl
+        _write_state(data)
+
+
+def _build_personal_list_embed(
+    state: dict[str, Any],
+    guild_id: int,
+    user_id: int,
+    *,
+    display_name: str,
+) -> discord.Embed:
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        pl = {}
+    order_keys = pl.get("order")
+    if not isinstance(order_keys, list):
+        order_keys = []
+    order_set = {str(x).strip() for x in order_keys if str(x).strip()}
+    top5_raw = pl.get("top5") if isinstance(pl.get("top5"), list) else []
+    top5_keys: list[str] = []
+    for x in top5_raw:
+        ks = str(x).strip()
+        if ks and ks in order_set and ks not in top5_keys:
+            top5_keys.append(ks)
+        if len(top5_keys) >= 5:
+            break
+    top5_set = set(top5_keys)
+
+    lines_top: list[str] = []
+    lines_rest: list[str] = []
+    for k in top5_keys:
+        title = _title_for_list_key(state, k)
+        url = _jump_for_list_key(state, guild_id, k)
+        lines_top.append(f"• [{title}]({url})")
+    for k in _ordered_keys_for_personal(pl):
+        if k in top5_set:
+            continue
+        title = _title_for_list_key(state, k)
+        url = _jump_for_list_key(state, guild_id, k)
+        lines_rest.append(f"• [{title}]({url})")
+
+    embed = discord.Embed(
+        title="📋 Список аниме (Discord)",
+        description=f"Участник **{display_name}** — тайтлы, добавленные в основном форуме аниме.",
+        color=EMBED_COLOR,
+    )
+    if lines_top:
+        embed.add_field(
+            name="⭐ Топ (до 5)",
+            value=_truncate("\n".join(lines_top[:5]), EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+    if lines_rest:
+        body = "\n".join(lines_rest[:80])
+        if len(lines_rest) > 80:
+            body += f"\n_…и ещё {len(lines_rest) - 80}_"
+        embed.add_field(
+            name="Остальные",
+            value=_truncate(body, EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+    if not lines_top and not lines_rest:
+        embed.add_field(
+            name="Остальные",
+            value="_Пока пусто — добавьте аниме через `/animeadd` в основном форуме._",
+            inline=False,
+        )
+    embed.set_footer(text="Ссылки ведут в темы основного форума (или на MAL / YummyAnime).")
+    return embed
+
+
+async def refresh_personal_list_message(client: discord.Client, guild_id: int, user_id: int) -> None:
+    state = await read_state_copy()
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return
+    try:
+        tid = int(pl.get("thread_id") or 0)
+        mid = int(pl.get("list_message_id") or 0)
+    except (TypeError, ValueError):
+        return
+    if not tid or not mid:
+        return
+    guild = client.get_guild(guild_id)
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(guild_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    member = guild.get_member(user_id)
+    display_name = member.display_name if member else str(user_id)
+    embed = _build_personal_list_embed(
+        state, guild_id, user_id, display_name=display_name
+    )
+    thread = client.get_channel(tid)
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(tid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    if not isinstance(thread, discord.Thread):
+        return
+    try:
+        msg = await thread.fetch_message(mid)
+        await msg.edit(embed=embed)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        try:
+            msg = await thread.send(embed=embed)
+        except discord.HTTPException:
+            return
+        await _save_personal_list_slot(
+            user_id,
+            thread_id=thread.id,
+            starter_message_id=int(pl.get("starter_message_id") or 0),
+            list_message_id=msg.id,
+        )
+
+
+async def ensure_personal_list_thread(
+    client: discord.Client,
+    guild: discord.Guild,
+    member: discord.Member,
+    *,
+    session: aiohttp.ClientSession | None,
+) -> discord.Thread | None:
+    """Создаёт тему в LIST_FORUM при первом добавлении, если её ещё нет."""
+    uid = member.id
+    async with _state_lock:
+        data = _load_state()
+        pl_raw = (data.get("personal_lists") or {}).get(str(uid))
+        existing_id = pl_raw.get("thread_id") if isinstance(pl_raw, dict) else None
+
+    if existing_id:
+        try:
+            eid = int(existing_id)
+        except (TypeError, ValueError):
+            eid = 0
+        if eid:
+            ch = client.get_channel(eid)
+            if ch is None:
+                try:
+                    ch = await client.fetch_channel(eid)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    ch = None
+            if isinstance(ch, discord.Thread) and ch.parent_id == LIST_FORUM_CHANNEL_ID:
+                await apply_personal_list_permissions(ch, guild, uid)
+                return ch
+
+    forum = await resolve_list_forum_channel(client)
+    if not forum:
+        logger.warning("Канал личных списков %s не найден.", LIST_FORUM_CHANNEL_ID)
+        return None
+
+    name = f"{member.display_name} anime list"[:100]
+    intro = (
+        f"{member.mention} — **личный список аниме**.\n\n"
+        "Название темы и этот текст можно сменить: `/editmyanimelist`\n"
+        "Топ-5 для отображения сверху: `/settopanime`\n\n"
+        "_Ниже бот обновляет список тайтлов из основного форума._"
+    )
+    try:
+        twm = await forum.create_thread(name=name, content=intro)
+        thread = twm.thread
+        starter = twm.message
+    except discord.Forbidden:
+        logger.warning("Нет прав создавать темы в форуме личных списков.")
+        return None
+    except discord.HTTPException as e:
+        logger.warning("Создание личной темы: %s", e)
+        return None
+
+    state = await read_state_copy()
+    embed = _build_personal_list_embed(
+        state, guild.id, uid, display_name=member.display_name
+    )
+    try:
+        list_msg = await thread.send(embed=embed)
+    except discord.HTTPException:
+        list_msg = None
+
+    await apply_personal_list_permissions(thread, guild, uid)
+
+    if starter and list_msg:
+        await _save_personal_list_slot(
+            uid,
+            thread_id=thread.id,
+            starter_message_id=starter.id,
+            list_message_id=list_msg.id,
+        )
+    return thread
+
+
+async def append_user_anime_to_personal_state(
+    guild: discord.Guild,
+    user_id: int,
+    key: str,
+    title: str,
+) -> None:
+    """Добавляет ключ в порядок списка и кэш названий; затем обновляет сообщение в личной теме."""
+    key = str(key).strip()
+    if not key:
+        return
+    title = (title or "").strip() or _title_for_list_key(await read_state_copy(), key)
+    async with _state_lock:
+        data = _load_state()
+        uid = str(user_id)
+        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        order = pl.get("order")
+        if not isinstance(order, list):
+            order = []
+        if key not in order:
+            order.append(key)
+        pl["order"] = order
+        st = data.setdefault("slug_titles", {})
+        st[key] = title[:500]
+        data["slug_titles"] = st
+        data["personal_lists"][uid] = pl
+        _write_state(data)
+
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.warning("Не удалось получить участника %s для личного списка.", user_id)
+            return
+    await ensure_personal_list_thread(bot, guild, member, session=bot.session)
+    await refresh_personal_list_message(bot, guild.id, user_id)
+
+
+def list_personal_anime_pairs(
+    state: dict[str, Any], guild_id: int, user_id: int
+) -> list[tuple[str, str]]:
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    for k in _ordered_keys_for_personal(pl):
+        t = _title_for_list_key(state, k)
+        u = _jump_for_list_key(state, guild_id, k)
+        out.append((t, u))
+    return out
+
+
+async def sync_personal_list_from_anime_topics(
+    guild: discord.Guild, target_id: int
+) -> tuple[int, str | None]:
+    """
+    Строит order из anime_topics (где пользователь в adders). Возвращает (число ключей, ошибка).
+    """
+    async with _state_lock:
+        data = _load_state()
+        topics = data.get("anime_topics", {})
+        if not isinstance(topics, dict):
+            return 0, "Нет данных anime_topics."
+        keys: list[str] = []
+        for key, ent in topics.items():
+            if not isinstance(ent, dict):
+                continue
+            if target_id not in _parse_adder_ids(ent.get("adders")):
+                continue
+            ks = str(key).strip()
+            if ks:
+                keys.append(ks)
+        keys.sort(key=lambda x: _title_for_list_key(data, x).lower())
+        uid = str(target_id)
+        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        old_top = pl.get("top5")
+        if not isinstance(old_top, list):
+            old_top = []
+        new_top = [str(x).strip() for x in old_top if str(x).strip() in keys][:5]
+        pl["order"] = keys
+        pl["top5"] = new_top
+        data["personal_lists"][uid] = pl
+        # обновить кэш названий из threads
+        threads_raw = data.get("threads", {})
+        st = data.setdefault("slug_titles", {})
+        for k in keys:
+            ent = topics.get(k)
+            if not isinstance(ent, dict):
+                continue
+            tid = str(ent.get("thread_id") or "")
+            meta = threads_raw.get(tid) if isinstance(threads_raw, dict) else None
+            if isinstance(meta, dict):
+                tt = (meta.get("title") or "").strip()
+                if tt:
+                    st[k] = tt[:500]
+        data["slug_titles"] = st
+        _write_state(data)
+    return len(keys), None
 
 
 async def create_yummy_forum_thread(
@@ -1682,6 +2117,11 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
     thread, merge_st = await merge_adder_into_existing_topic(bot, slug_key, user_id)
     if merge_st == "merged":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
+        tname = thread.name[:200] if thread else (info.get("title") or slug_key)
+        try:
+            await append_user_anime_to_personal_state(guild, user_id, slug_key, tname)
+        except Exception:
+            logger.exception("Личный список после merge animeadd")
         return f"Тема уже была — добавил вас в подпись: {link}"
     if merge_st == "already":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
@@ -1696,6 +2136,12 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
     )
     if err or not thread:
         return err or "Не удалось создать тему."
+    try:
+        await append_user_anime_to_personal_state(
+            guild, user_id, slug_key, str(info.get("title") or "")[:500]
+        )
+    except Exception:
+        logger.exception("Личный список после создания темы animeadd")
     link = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
     return f"Готово: {link}"
 
@@ -1764,34 +2210,29 @@ async def build_mal_list_embed_for_member(
 async def run_animelist_discord_topics(
     guild: discord.Guild, target: discord.Member
 ) -> tuple[discord.Embed | None, str | None, int, int]:
-    """Аниме из веток форума по adders. (embed, err, scanned, updated)."""
-    scanned, updated = await sync_forum_threads_with_state(
-        bot, guild, bot.session if bot.session else None
-    )
+    """Аниме из сохранённого личного списка (без полного сканирования форума)."""
     state = await read_state_copy()
-    pairs = list_discord_added_anime_for_user(state, guild.id, target.id)
+    pairs = list_personal_anime_pairs(state, guild.id, target.id)
     if not pairs:
         return (
             None,
-            f"{target.mention} пока не числится среди добавивших ни в одной теме форума "
-            f"(или темы не удалось разобрать). Просмотрено веток: **{scanned}**, "
-            f"обновлено записей: **{updated}**.",
-            scanned,
-            updated,
+            f"{target.mention} — в личном списке пока нет записей. "
+            "Они появляются при добавлении аниме в основной форум (`/animeadd`). "
+            "Если вы уже добавляли раньше, админ может выполнить `/syncanimelist` для вашего профиля.",
+            0,
+            0,
         )
     lines = [f"• [{t}]({u})" for t, u in pairs[:60]]
     body = "\n".join(lines)
     if len(pairs) > 60:
         body += f"\n_…и ещё {len(pairs) - 60}_"
     embed = discord.Embed(
-        title=f"Добавлено в Discord — {target.display_name}",
+        title=f"Discord-лист — {target.display_name}",
         description=_truncate(body, EMBED_DESC_LIMIT),
         color=EMBED_COLOR,
     )
-    embed.set_footer(
-        text=f"Форум синхронизирован: веток {scanned}, записей обновлено {updated}"
-    )
-    return embed, None, scanned, updated
+    embed.set_footer(text="Данные из личной темы списков · команда /checkanime")
+    return embed, None, len(pairs), 0
 
 
 @bot.event
@@ -1998,6 +2439,13 @@ async def connectmyanimelist(
                         else f"<#{thread.id}>"
                     )
                     merged_urls.append(ju)
+                    try:
+                        tnm = thread.name[:200] if thread else query
+                        await append_user_anime_to_personal_state(
+                            interaction.guild, uid, slug_key, tnm
+                        )
+                    except Exception:
+                        logger.exception("Личный список после merge MAL→Yummy")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
                     errors.append(
                         "Достигнут лимит дописываний в существующие темы за один запуск; "
@@ -2042,6 +2490,13 @@ async def connectmyanimelist(
                         else f"<#{thread.id}>"
                     )
                     merged_urls.append(ju)
+                    try:
+                        tnm = thread.name[:200] if thread else query
+                        await append_user_anime_to_personal_state(
+                            interaction.guild, uid, f"mal:{aid}", tnm
+                        )
+                    except Exception:
+                        logger.exception("Личный список после merge MAL-only")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
                     errors.append(
                         "Достигнут лимит дописываний в существующие темы за один запуск; "
@@ -2075,6 +2530,17 @@ async def connectmyanimelist(
         if not thread:
             errors.append(f"{query}: неизвестная ошибка")
             continue
+
+        try:
+            if info:
+                pk = _clean_slug((info.get("anime_url") or "").strip())
+                pt = str(info.get("title") or query)[:500]
+            else:
+                pk = f"mal:{aid}"
+                pt = mal_item_title(entry)
+            await append_user_anime_to_personal_state(interaction.guild, uid, pk, pt)
+        except Exception:
+            logger.exception("Личный список после новой темы из connectmyanimelist")
 
         await mark_mal_imported(interaction.user.id, aid)
         imported_ids.add(aid)
@@ -2206,7 +2672,7 @@ async def myanimelist(interaction: discord.Interaction, member: discord.Member |
 
 @bot.tree.command(
     name="animelist",
-    description="Аниме, которые пользователь добавлял в ветки форума на сервере (не список с MyAnimeList)",
+    description="Личный Discord-список аниме (как в теме форума списков), без полного сканирования форума",
 )
 @app_commands.describe(member="Чей список (если не указано — ваш)")
 async def animelist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
@@ -2233,6 +2699,259 @@ async def animelist(interaction: discord.Interaction, member: discord.Member | N
         return
     assert embed is not None
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _personal_slug_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    state = await read_state_copy()
+    uid = str(interaction.user.id)
+    pl = (state.get("personal_lists") or {}).get(uid)
+    if not isinstance(pl, dict):
+        return []
+    order = pl.get("order")
+    if not isinstance(order, list):
+        return []
+    cur = (current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    for k in order:
+        ks = str(k).strip()
+        if not ks:
+            continue
+        title = _title_for_list_key(state, ks)
+        if cur and cur not in title.lower() and cur not in ks.lower():
+            continue
+        label = _truncate(f"{title} ({ks})", 100)
+        choices.append(app_commands.Choice(name=label, value=ks))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+@bot.tree.command(
+    name="checkanime",
+    description="Список аниме из личного Discord-листа (без обхода всего форума)",
+)
+@app_commands.describe(member="Чей список показать (по умолчанию ваш)")
+async def checkanime(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    raw_target = member or interaction.user
+    target = (
+        raw_target
+        if isinstance(raw_target, discord.Member)
+        else interaction.guild.get_member(raw_target.id)
+    )
+    if target is None:
+        await interaction.response.send_message(
+            "Укажите участника этого сервера.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    embed, err, _s, _u = await run_animelist_discord_topics(interaction.guild, target)
+    if err:
+        await interaction.followup.send(_truncate(err, DISCORD_CONTENT_LIMIT), ephemeral=True)
+        return
+    assert embed is not None
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="syncanimelist",
+    description="[Администраторы] Синхронизировать личный список участника с темами основного форума",
+)
+@app_commands.describe(member="Чей список пересобрать из базы бота")
+@app_commands.default_permissions(administrator=True)
+async def syncanimelist(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Команда только для **администраторов** сервера.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    scanned, updated = await sync_forum_threads_with_state(
+        bot, interaction.guild, bot.session if bot.session else None
+    )
+    n, err = await sync_personal_list_from_anime_topics(interaction.guild, member.id)
+    try:
+        await ensure_personal_list_thread(
+            bot, interaction.guild, member, session=bot.session
+        )
+        await refresh_personal_list_message(bot, interaction.guild.id, member.id)
+    except Exception:
+        logger.exception("syncanimelist: обновление личной темы")
+    parts = [
+        f"Основной форум: просмотрено веток **{scanned}**, обновлено записей **{updated}**.",
+        f"В личном списке **{member.display_name}**: **{n}** позиций.",
+    ]
+    if err:
+        parts.append(str(err))
+    await interaction.followup.send("\n".join(parts), ephemeral=True)
+
+
+@bot.tree.command(
+    name="settopanime",
+    description="Задать до 5 аниме для блока «Топ» в вашей личной теме списка",
+)
+@app_commands.describe(
+    slot1="1-е место топа",
+    slot2="2-е место",
+    slot3="3-е место",
+    slot4="4-е место",
+    slot5="5-е место",
+)
+@app_commands.autocomplete(
+    slot1=_personal_slug_autocomplete,
+    slot2=_personal_slug_autocomplete,
+    slot3=_personal_slug_autocomplete,
+    slot4=_personal_slug_autocomplete,
+    slot5=_personal_slug_autocomplete,
+)
+async def settopanime(
+    interaction: discord.Interaction,
+    slot1: str | None = None,
+    slot2: str | None = None,
+    slot3: str | None = None,
+    slot4: str | None = None,
+    slot5: str | None = None,
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+
+    raw_slots = [slot1, slot2, slot3, slot4, slot5]
+    slots = [str(s).strip() for s in raw_slots if s and str(s).strip()]
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    uid = interaction.user.id
+    uid_s = str(uid)
+    state = await read_state_copy()
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        await interaction.followup.send(
+            "Личного списка ещё нет — сначала добавьте аниме через `/animeadd`.",
+            ephemeral=True,
+        )
+        return
+    order = pl.get("order")
+    if not isinstance(order, list):
+        order = []
+
+    if not slots:
+        async with _state_lock:
+            data = _load_state()
+            pl2 = data.setdefault("personal_lists", {}).setdefault(uid_s, {})
+            pl2["top5"] = []
+            data["personal_lists"][uid_s] = pl2
+            _write_state(data)
+        await refresh_personal_list_message(bot, interaction.guild.id, uid)
+        await interaction.followup.send("Топ очищен. Сообщение в личной теме обновлено.", ephemeral=True)
+        return
+
+    uniq = list(dict.fromkeys(slots))[:5]
+    for s in uniq:
+        if s not in order:
+            await interaction.followup.send(
+                f"В вашем списке нет ключа `{s}`. Выберите значения из автодополнения.",
+                ephemeral=True,
+            )
+            return
+
+    async with _state_lock:
+        data = _load_state()
+        pl2 = data.setdefault("personal_lists", {}).setdefault(uid_s, {})
+        pl2["top5"] = uniq
+        data["personal_lists"][uid_s] = pl2
+        _write_state(data)
+    await refresh_personal_list_message(bot, interaction.guild.id, uid)
+    await interaction.followup.send(
+        f"Топ сохранён (**{len(uniq)}**). Сообщение в личной теме обновлено.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="editmyanimelist",
+    description="Изменить название и первый пост в вашей личной теме списка аниме",
+)
+@app_commands.describe(
+    name="Новое название темы форума",
+    description="Новый текст первого сообщения в теме",
+)
+async def editmyanimelist(
+    interaction: discord.Interaction,
+    name: str | None = None,
+    description: str | None = None,
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    if not name and not description:
+        await interaction.response.send_message(
+            "Укажите **name** и/или **description**.", ephemeral=True
+        )
+        return
+
+    uid = interaction.user.id
+    uid_s = str(uid)
+    state = await read_state_copy()
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict) or not pl.get("thread_id"):
+        await interaction.response.send_message(
+            "Личной темы ещё нет — она создаётся при первом добавлении аниме в основной форум.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    tid = int(pl["thread_id"])
+    thread = interaction.client.get_channel(tid)
+    if thread is None:
+        try:
+            thread = await interaction.client.fetch_channel(tid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            thread = None
+    if not isinstance(thread, discord.Thread):
+        await interaction.followup.send("Личная тема не найдена (проверьте ID).", ephemeral=True)
+        return
+
+    if name:
+        try:
+            await thread.edit(name=name.strip()[:100])
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"Не удалось сменить название: {e}", ephemeral=True)
+            return
+
+    if description:
+        sid = int(pl.get("starter_message_id") or 0)
+        if not sid:
+            await interaction.followup.send(
+                "В базе нет id первого сообщения — удалите тему и дайте боту создать заново.",
+                ephemeral=True,
+            )
+            return
+        try:
+            msg = await thread.fetch_message(sid)
+            await msg.edit(content=_truncate(description.strip(), 2000))
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"Не удалось изменить пост: {e}", ephemeral=True)
+            return
+
+    await interaction.followup.send("Готово.", ephemeral=True)
 
 
 @bot.tree.command(
