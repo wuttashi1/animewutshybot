@@ -2295,6 +2295,7 @@ async def _save_personal_thread_meta(
     thread_id: int,
     starter_message_id: int,
     control_message_id: int | None = None,
+    clear_control_message: bool = False,
 ) -> None:
     async with _state_lock:
         data = _load_state()
@@ -2302,7 +2303,9 @@ async def _save_personal_thread_meta(
         pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
         pl["thread_id"] = thread_id
         pl["starter_message_id"] = starter_message_id
-        if control_message_id is not None:
+        if clear_control_message:
+            pl.pop("control_message_id", None)
+        elif control_message_id is not None:
             pl["control_message_id"] = control_message_id
         pl.setdefault("anime_messages", {})
         pl.setdefault("accent_color", EMBED_COLOR)
@@ -2310,6 +2313,70 @@ async def _save_personal_thread_meta(
         pl.setdefault("compact_cards", False)
         data["personal_lists"][uid] = pl
         _write_state(data)
+
+
+async def _first_thread_message(thread: discord.Thread) -> discord.Message | None:
+    starter = thread.starter_message
+    if starter is not None:
+        return starter
+    try:
+        async for m in thread.history(limit=1, oldest_first=True):
+            return m
+    except discord.HTTPException:
+        return None
+    return None
+
+
+def _starter_looks_like_personal_list(content: str, user_id: int) -> bool:
+    c = (content or "").lower()
+    if "личный список" not in c and "anime list" not in c:
+        return False
+    uid_s = str(user_id)
+    return f"<@{uid_s}>" in content or f"<@!{uid_s}>" in content
+
+
+async def _find_existing_personal_list_thread(
+    client: discord.Client,
+    guild: discord.Guild,
+    forum: discord.ForumChannel,
+    member: discord.Member,
+) -> discord.Thread | None:
+    """
+    Если в базе нет thread_id (или он битый), ищем уже созданную личную тему в форуме списков
+    по первому сообщению с упоминанием пользователя — чтобы не плодить дубликаты.
+    """
+    uid = member.id
+    seen: set[int] = set()
+    candidates: list[discord.Thread] = []
+
+    async def consider(th: discord.Thread) -> None:
+        if th.id in seen or th.parent_id != forum.id:
+            return
+        first = await _first_thread_message(th)
+        if first is None:
+            return
+        if not _starter_looks_like_personal_list(first.content, uid):
+            return
+        seen.add(th.id)
+        candidates.append(th)
+
+    for th in forum.threads:
+        await consider(th)
+    gt = guild.threads
+    seq = gt.values() if hasattr(gt, "values") else gt
+    for th in seq:
+        if isinstance(th, discord.Thread):
+            await consider(th)
+    try:
+        async for th in forum.archived_threads(limit=100):
+            await consider(th)
+    except discord.HTTPException as e:
+        logger.warning("Архив форума личных списков: %s", e)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t.id)
+    return candidates[0]
 
 
 async def _set_personal_list_fields(user_id: int, **fields: Any) -> None:
@@ -2530,6 +2597,40 @@ async def ensure_personal_list_thread(
             logger.warning("Канал личных списков %s не найден.", LIST_FORUM_CHANNEL_ID)
             return None
 
+        found = await _find_existing_personal_list_thread(client, guild, forum, member)
+        if found is not None:
+            await apply_personal_list_permissions(found, guild, uid)
+            first = await _first_thread_message(found)
+            if first is None:
+                await asyncio.sleep(0.25)
+                first = await _first_thread_message(found)
+            if first is not None:
+                await _save_personal_thread_meta(
+                    uid,
+                    thread_id=found.id,
+                    starter_message_id=first.id,
+                    clear_control_message=True,
+                )
+                logger.info(
+                    "Личный список: привязана существующая тема %s для пользователя %s",
+                    found.id,
+                    uid,
+                )
+            else:
+                async with _state_lock:
+                    data = _load_state()
+                    pl = data.setdefault("personal_lists", {}).setdefault(str(uid), {})
+                    pl["thread_id"] = found.id
+                    pl.pop("control_message_id", None)
+                    pl.pop("starter_message_id", None)
+                    data["personal_lists"][str(uid)] = pl
+                    _write_state(data)
+                logger.warning(
+                    "Личная тема %s: не удалось прочитать первый пост; сохранён только thread_id",
+                    found.id,
+                )
+            return found
+
         name = f"{member.display_name} anime list"[:100]
         intro = (
             f"{member.mention} — **личный список аниме**.\n\n"
@@ -2548,6 +2649,9 @@ async def ensure_personal_list_thread(
             logger.warning("Создание личной темы: %s", e)
             return None
 
+        if starter is None:
+            starter = await _first_thread_message(thread)
+
         stub_pl = {
             "accent_color": EMBED_COLOR,
             "show_numbers": False,
@@ -2555,19 +2659,26 @@ async def ensure_personal_list_thread(
         }
         hub_embed = _personal_hub_embed(stub_pl, member.display_name)
         hub_view = PersonalTopicHubView()
+        hub_msg = None
         try:
             hub_msg = await thread.send(embed=hub_embed, view=hub_view)
-        except discord.HTTPException:
-            hub_msg = None
+        except discord.HTTPException as e:
+            logger.warning("Панель в новой личной теме %s: %s", thread.id, e)
 
         await apply_personal_list_permissions(thread, guild, uid)
 
-        if starter and hub_msg:
+        # Всегда сохраняем thread_id, иначе при следующем аниме создаётся ещё одна тема.
+        if starter is not None:
             await _save_personal_thread_meta(
                 uid,
                 thread_id=thread.id,
                 starter_message_id=starter.id,
-                control_message_id=hub_msg.id,
+                control_message_id=hub_msg.id if hub_msg else None,
+            )
+        else:
+            logger.error(
+                "Личная тема %s: нет стартового сообщения, thread_id не записан в базу",
+                thread.id,
             )
         return thread
 
