@@ -2,7 +2,7 @@
 Discord-бот: основной форум аниме (/forum_add), личные списки (форум из DISCORD_LIST_FORUM_CHANNEL_ID),
 /mylist_show, MAL (/mal_bind, /mal_import, /mal_show), YummyAnime (/yummy_link, /yummy_sync, …),
 фоновый опрос Yummy, /admin, /adminpanel, /update_topics.
-Состояние: data/mal_state.json или MongoDB (MONGODB_URI) — токены и списки переживают перезапуск.
+Состояние: data/*.json локально; при MONGODB_URI и MONGODB_LOCAL_FIRST=1 (по умолчанию) Mongo обновляется в фоне.
 Форумы: DISCORD_ANIME_FORUM_CHANNEL_ID, DISCORD_LIST_FORUM_CHANNEL_ID, DISCORD_BOT_INFO_THREAD_ID (без .env бот не использует старые ID).
 Справка: ветка DISCORD_BOT_INFO_THREAD_ID (автообновление при старте и /admin refresh_help_thread).
 Токен бота: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
@@ -542,6 +542,59 @@ _yummy_link_state_lock = asyncio.Lock()
 YUMMY_LINK_PENDING_TTL_SEC = 900
 YUMMY_LINK_READY_TTL_SEC = 600
 
+# Локальный JSON → MongoDB (фон): поколения для отслеживания несохранённых записей
+_main_cloud_gen = 0
+_last_main_cloud_push_gen = -1
+_yummy_cloud_gen = 0
+_last_yummy_cloud_push_gen = -1
+
+
+def _atomic_write_json_path(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _bump_main_cloud_gen() -> None:
+    global _main_cloud_gen
+    _main_cloud_gen += 1
+
+
+def _main_cloud_push_pending() -> bool:
+    return _main_cloud_gen > _last_main_cloud_push_gen
+
+
+def _ack_main_cloud_push(snap_gen: int) -> None:
+    global _last_main_cloud_push_gen
+    if _main_cloud_gen == snap_gen:
+        _last_main_cloud_push_gen = snap_gen
+
+
+def _bump_yummy_cloud_gen() -> None:
+    global _yummy_cloud_gen
+    _yummy_cloud_gen += 1
+
+
+def _yummy_cloud_push_pending() -> bool:
+    return _yummy_cloud_gen > _last_yummy_cloud_push_gen
+
+
+def _ack_yummy_cloud_push(snap_gen: int) -> None:
+    global _last_yummy_cloud_push_gen
+    if _yummy_cloud_gen == snap_gen:
+        _last_yummy_cloud_push_gen = snap_gen
+
+
+def _mark_main_cloud_in_sync() -> None:
+    global _last_main_cloud_push_gen
+    _last_main_cloud_push_gen = _main_cloud_gen
+
+
+def _mark_yummy_cloud_in_sync() -> None:
+    global _last_yummy_cloud_push_gen
+    _last_yummy_cloud_push_gen = _yummy_cloud_gen
+
 
 def _personal_list_thread_lock(user_id: int) -> asyncio.Lock:
     lock = _personal_list_thread_locks.get(user_id)
@@ -580,6 +633,23 @@ def _load_yummy_link_from_file() -> dict[str, Any] | None:
 
 
 def _load_yummy_link_state_raw() -> dict[str, Any]:
+    if mongo_store.mongo_enabled() and mongo_store.local_first_enabled():
+        file_data = _load_yummy_link_from_file()
+        if file_data is not None:
+            return file_data
+        got = mongo_store.load_json_document(mongo_store.DOC_YUMMY_LINK)
+        if got is not None:
+            norm = _normalize_yummy_link_state(copy.deepcopy(got))
+            try:
+                _atomic_write_json_path(YUMMY_LINK_STATE_PATH, norm)
+            except OSError:
+                logger.exception(
+                    "Не удалось сохранить локальный %s после загрузки из MongoDB.",
+                    YUMMY_LINK_STATE_PATH,
+                )
+            _mark_yummy_cloud_in_sync()
+            return norm
+        return _default_yummy_link_state()
     if mongo_store.mongo_enabled():
         got = mongo_store.load_json_document(mongo_store.DOC_YUMMY_LINK)
         if got is not None:
@@ -598,19 +668,17 @@ def _load_yummy_link_state_raw() -> dict[str, Any]:
 
 
 def _save_yummy_link_state_raw(data: dict[str, Any]) -> None:
+    if mongo_store.mongo_enabled() and mongo_store.local_first_enabled():
+        _atomic_write_json_path(YUMMY_LINK_STATE_PATH, data)
+        _bump_yummy_cloud_gen()
+        return
     if mongo_store.mongo_enabled():
         if not mongo_store.save_json_document(mongo_store.DOC_YUMMY_LINK, data):
             logger.error("Не удалось записать yummy_link в MongoDB — пробую файл.")
         if mongo_store.mirror_json_to_file_enabled():
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            YUMMY_LINK_STATE_PATH.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            _atomic_write_json_path(YUMMY_LINK_STATE_PATH, data)
         return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    YUMMY_LINK_STATE_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _atomic_write_json_path(YUMMY_LINK_STATE_PATH, data)
 
 
 def _yummy_link_prune_pending_unlocked(pending: dict[str, Any], now: float) -> None:
@@ -779,6 +847,23 @@ def _load_state_from_file() -> dict[str, Any] | None:
 
 
 def _load_state() -> dict[str, Any]:
+    if mongo_store.mongo_enabled() and mongo_store.local_first_enabled():
+        file_data = _load_state_from_file()
+        if file_data is not None:
+            return file_data
+        got = mongo_store.load_json_document(mongo_store.DOC_MAIN_STATE)
+        if got is not None:
+            norm = _normalize_loaded_state(copy.deepcopy(got))
+            try:
+                _atomic_write_json_path(STATE_PATH, norm)
+            except OSError:
+                logger.exception(
+                    "Не удалось сохранить локальный %s после загрузки из MongoDB.",
+                    STATE_PATH,
+                )
+            _mark_main_cloud_in_sync()
+            return norm
+        return _default_state()
     if mongo_store.mongo_enabled():
         got = mongo_store.load_json_document(mongo_store.DOC_MAIN_STATE)
         if got is not None:
@@ -797,19 +882,17 @@ def _load_state() -> dict[str, Any]:
 
 
 def _write_state(data: dict[str, Any]) -> None:
+    if mongo_store.mongo_enabled() and mongo_store.local_first_enabled():
+        _atomic_write_json_path(STATE_PATH, data)
+        _bump_main_cloud_gen()
+        return
     if mongo_store.mongo_enabled():
         if not mongo_store.save_json_document(mongo_store.DOC_MAIN_STATE, data):
             logger.error("Не удалось записать состояние в MongoDB — пробую файл.")
         if mongo_store.mirror_json_to_file_enabled():
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = STATE_PATH.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(STATE_PATH)
+            _atomic_write_json_path(STATE_PATH, data)
         return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_PATH)
+    _atomic_write_json_path(STATE_PATH, data)
 
 
 def mal_username_from_url(text: str) -> str | None:
@@ -4278,6 +4361,7 @@ class YummyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.session: aiohttp.ClientSession | None = None
         self._yummy_poll_task: asyncio.Task[None] | None = None
+        self._mongo_replicator_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
@@ -4358,7 +4442,29 @@ class YummyBot(commands.Bot):
                 e.text,
             )
 
+        if mongo_store.mongo_enabled() and mongo_store.local_first_enabled():
+            self._mongo_replicator_task = asyncio.create_task(
+                _mongo_cloud_replicator_loop()
+            )
+            logger.info(
+                "MongoDB: локальные файлы в data/ первичны; облако обновляется каждые %s с "
+                "(MONGODB_CLOUD_FLUSH_SEC).",
+                mongo_store.cloud_flush_interval_sec(),
+            )
+
     async def close(self) -> None:
+        t_mongo = getattr(self, "_mongo_replicator_task", None)
+        if t_mongo is not None and not t_mongo.done():
+            t_mongo.cancel()
+            try:
+                await t_mongo
+            except asyncio.CancelledError:
+                pass
+            self._mongo_replicator_task = None
+        try:
+            await _mongo_cloud_drain_writes()
+        except Exception:
+            logger.exception("Финальная синхронизация состояния в MongoDB")
         runner = getattr(self, "_yummy_link_runner", None)
         if runner is not None:
             await runner.cleanup()
@@ -4369,6 +4475,61 @@ class YummyBot(commands.Bot):
 
 
 bot = YummyBot()
+
+
+async def _mongo_cloud_flush_once() -> None:
+    if not mongo_store.mongo_enabled() or not mongo_store.local_first_enabled():
+        return
+    if _main_cloud_push_pending():
+        g = _main_cloud_gen
+        data = _load_state_from_file()
+        if data is None:
+            if not STATE_PATH.is_file():
+                _ack_main_cloud_push(g)
+        elif _main_cloud_gen == g:
+            ok = await asyncio.to_thread(
+                mongo_store.save_json_document,
+                mongo_store.DOC_MAIN_STATE,
+                data,
+            )
+            if ok:
+                _ack_main_cloud_push(g)
+    if _yummy_cloud_push_pending():
+        g = _yummy_cloud_gen
+        data = _load_yummy_link_from_file()
+        if data is None:
+            if not YUMMY_LINK_STATE_PATH.is_file():
+                _ack_yummy_cloud_push(g)
+        elif _yummy_cloud_gen == g:
+            ok = await asyncio.to_thread(
+                mongo_store.save_json_document,
+                mongo_store.DOC_YUMMY_LINK,
+                data,
+            )
+            if ok:
+                _ack_yummy_cloud_push(g)
+
+
+async def _mongo_cloud_replicator_loop() -> None:
+    await bot.wait_until_ready()
+    interval = mongo_store.cloud_flush_interval_sec()
+    while not bot.is_closed():
+        try:
+            await _mongo_cloud_flush_once()
+        except Exception:
+            logger.exception("Фон: синхронизация локального состояния → MongoDB")
+        await asyncio.sleep(interval)
+
+
+async def _mongo_cloud_drain_writes() -> None:
+    if not mongo_store.mongo_enabled() or not mongo_store.local_first_enabled():
+        return
+    for _ in range(400):
+        if not _main_cloud_push_pending() and not _yummy_cloud_push_pending():
+            return
+        await _mongo_cloud_flush_once()
+        await asyncio.sleep(0.05)
+
 
 TEXT_ANIMEADD_RE = re.compile(
     r"^(?:!aa|!animeadd|!forum_add|/aa|/animeadd|/forum_add)\s+(.+)$",

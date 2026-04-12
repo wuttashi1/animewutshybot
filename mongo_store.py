@@ -78,6 +78,26 @@ def mirror_json_to_file_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def local_first_enabled() -> bool:
+    """
+    Если Mongo включён: сначала локальные JSON в data/, синхронизация в облако в фоне.
+    Отключить: MONGODB_LOCAL_FIRST=0 (режим «облако первично», как раньше).
+    """
+    if not mongo_enabled():
+        return False
+    raw = (os.environ.get("MONGODB_LOCAL_FIRST") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def cloud_flush_interval_sec() -> float:
+    raw = (os.environ.get("MONGODB_CLOUD_FLUSH_SEC") or "2").strip()
+    try:
+        v = float(raw.replace(",", "."))
+    except ValueError:
+        v = 2.0
+    return max(0.5, min(120.0, v))
+
+
 def ping() -> bool:
     coll = _collection()
     if coll is None:
