@@ -1,6 +1,6 @@
 """
 Discord-бот: основной форум аниме (/forum_add), личные списки (форум из DISCORD_LIST_FORUM_CHANNEL_ID),
-/mylist_show, MAL (/mal_bind, /mal_import, /mal_show), YummyAnime (/yummy_link, /yummy_sync, …),
+/mylist_show, /newanimelist, MAL (/mal_bind, /mal_import, /mal_show), YummyAnime (/yummy_link, /yummy_sync, …),
 фоновый опрос Yummy, /admin, /adminpanel, /update_topics.
 Состояние: data/*.json локально; при MONGODB_URI и MONGODB_LOCAL_FIRST=1 (по умолчанию) Mongo обновляется в фоне.
 Форумы: DISCORD_ANIME_FORUM_CHANNEL_ID, DISCORD_LIST_FORUM_CHANNEL_ID, DISCORD_BOT_INFO_THREAD_ID (без .env бот не использует старые ID).
@@ -1234,6 +1234,102 @@ def schedule_personal_list_refresh(guild_id: int, user_id: int) -> None:
     _personal_rebuild_tasks[key] = asyncio.create_task(_runner())
 
 
+async def purge_discord_user_bot_data(
+    guild_id: int, target_user_id: int
+) -> dict[str, Any]:
+    """
+    Удаляет из основного состояния (mal_state) всё, что относится к Discord-пользователю.
+    Не правит тексты постов в темах форума — только JSON/Mongo.
+    """
+    uid = int(target_user_id)
+    uid_s = str(uid)
+    stats: dict[str, Any] = {
+        "personal_list": 0,
+        "yummy_account": 0,
+        "mal_account": 0,
+        "imported_yummy": 0,
+        "imported_mal": 0,
+        "anime_topics_adders_cleared": 0,
+        "ratings_removed": 0,
+        "yummy_link_ready": 0,
+        "yummy_link_pending": 0,
+    }
+
+    async with _state_lock:
+        data = _load_state()
+        pls = data.setdefault("personal_lists", {})
+        if uid_s in pls:
+            pls.pop(uid_s, None)
+            stats["personal_list"] = 1
+        ya = data.setdefault("yummy_accounts", {})
+        if uid_s in ya:
+            ya.pop(uid_s, None)
+            stats["yummy_account"] = 1
+        ma = data.setdefault("mal_accounts", {})
+        if uid_s in ma:
+            ma.pop(uid_s, None)
+            stats["mal_account"] = 1
+        iy = data.setdefault("imported_yummy", {})
+        if uid_s in iy:
+            iy.pop(uid_s, None)
+            stats["imported_yummy"] = 1
+        im = data.setdefault("imported_mal", {})
+        if uid_s in im:
+            im.pop(uid_s, None)
+            stats["imported_mal"] = 1
+
+        topics = data.setdefault("anime_topics", {})
+        for akey, ent in list(topics.items()):
+            if not isinstance(ent, dict):
+                continue
+            cur = _parse_adder_ids(ent.get("adders"))
+            if uid not in cur:
+                continue
+            new_adders = [x for x in cur if x != uid]
+            ent["adders"] = new_adders
+            topics[akey] = ent
+            stats["anime_topics_adders_cleared"] += 1
+
+        ratings = data.setdefault("ratings", {})
+        for tid_s, inner in list(ratings.items()):
+            if not isinstance(inner, dict):
+                continue
+            if uid_s not in inner:
+                continue
+            inner.pop(uid_s, None)
+            stats["ratings_removed"] += 1
+            if not inner:
+                ratings.pop(tid_s, None)
+
+        _write_state(data)
+
+    key = (guild_id, uid)
+    task = _personal_rebuild_tasks.pop(key, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        ready = st.get("ready")
+        if isinstance(ready, dict) and uid_s in ready:
+            ready.pop(uid_s, None)
+            stats["yummy_link_ready"] = 1
+        pending = st.get("pending")
+        if isinstance(pending, dict):
+            for tok, v in list(pending.items()):
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    if int(v.get("user_id") or 0) == uid:
+                        pending.pop(tok, None)
+                        stats["yummy_link_pending"] += 1
+                except (TypeError, ValueError):
+                    continue
+        _save_yummy_link_state_raw(st)
+
+    return stats
+
+
 @dataclass
 class _DuplicateGroup:
     thread_ids: frozenset[int]
@@ -1725,9 +1821,11 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
             "реакции статуса (📺 смотрю · ✅ просмотрено · 📋 планы · ⏸️ отложено · ❌ брошено), "
             "панели **оценки** и **рекомендаций**.\n"
             "· **Форум личных списков** — у каждого участника своя тема. В теме: карточки аниме и **одна** "
-            "панель внизу (**Обновить**, **Yummy «Просмотрено»**, **Экспорт .txt**, **Тема**).\n"
+            "панель внизу (**Синхронизация с Yummy**, **Синхронизация личного списка**, **Обновить**, **Экспорт .txt**, **Тема**).\n"
             "· **Полный импорт Yummy** (все статусы) — `/yummy_sync`. Раз в **7 дней**: `/mylist_yummy_weekly` "
-            "(проверка дубликатов в личном списке + сверка со всеми списками Yummy). С панели — только **«Просмотрено»**.\n"
+            "(проверка дубликатов в личном списке + сверка со всеми списками Yummy). "
+            "С панели: сначала **синхронизация с Yummy** (1–1000 последних позиций), затем **личный список**.\n"
+            "· Старт с нуля: **`/newanimelist`** — создаёт личную тему и пошаговую инструкцию (**`/yummy_link`** первым шагом).\n"
             "· На карточках личного списка в поле **«Также в списках»** видно, у кого ещё на сервере "
             "есть это аниме.\n"
             "· Если задан **`MONGODB_URI`**, привязки Yummy/MAL и всё состояние бота **сохраняются** "
@@ -1768,6 +1866,11 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
         color=EMBED_COLOR,
     )
     mylist_rows = [
+        (
+            "`/newanimelist`",
+            "Создать **личную тему** в форуме списков и включить пошаговый режим: сначала **`/yummy_link`**, "
+            "потом кнопки на панели (Yummy → личный список).",
+        ),
         ("`/mylist_show`", "Показать ваш (или указанного участника) список из данных бота."),
         ("`/mylist_edit`", "Название и первый пост **вашей** личной темы."),
         ("`/mylist_top`", "До **5** аниме для блока «Топ» на карточках."),
@@ -1823,8 +1926,8 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
     admin_rows = [
         (
             "`/admin`",
-            "Подкоманды: `diagnostics`, `yummy_resync`, `yummy_status`, `forum_scan`, "
-            "`personal_rebuild`, `repair_topics`, **`refresh_help_thread`** (обновить эту справку).",
+            "Подкоманды: `diagnostics`, **`purge_user_data`**, `yummy_resync`, `yummy_status`, "
+            "`forum_scan`, `personal_rebuild`, `repair_topics`, **`refresh_help_thread`**.",
         ),
         ("`/adminpanel`", "Меню быстрых действий (скан форума, ремонт тем, статус фона Yummy)."),
         (
@@ -2055,6 +2158,60 @@ def _ordered_keys_for_personal_display(
     return out
 
 
+def _dedupe_personal_keys_by_thread(
+    keys_list: list[str], topics: dict[str, Any]
+) -> list[str]:
+    """
+    Один ключ на одну ветку основного форума в сохранённом order.
+    Иначе в anime_topics могут жить два slug на одну тему — в личном списке дублировались позиции.
+    """
+    tid_to_canon: dict[int, str] = {}
+    for k in keys_list:
+        ks = str(k).strip()
+        if not ks:
+            continue
+        ent = topics.get(ks)
+        if not isinstance(ent, dict):
+            continue
+        try:
+            tid = int(ent.get("thread_id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        if tid <= 0:
+            continue
+        prev = tid_to_canon.get(tid)
+        if prev is None or ks < prev:
+            tid_to_canon[tid] = ks
+
+    seen_tid: set[int] = set()
+    seen_noid: set[str] = set()
+    out: list[str] = []
+    for k in keys_list:
+        ks = str(k).strip()
+        if not ks:
+            continue
+        ent = topics.get(ks)
+        tid = 0
+        if isinstance(ent, dict):
+            try:
+                tid = int(ent.get("thread_id") or 0)
+            except (TypeError, ValueError):
+                tid = 0
+        if tid > 0:
+            if tid_to_canon.get(tid) != ks:
+                continue
+            if tid in seen_tid:
+                continue
+            seen_tid.add(tid)
+            out.append(ks)
+        else:
+            if ks in seen_noid:
+                continue
+            seen_noid.add(ks)
+            out.append(ks)
+    return out
+
+
 def _other_members_with_same_anime(
     state: dict[str, Any],
     guild: discord.Guild,
@@ -2261,11 +2418,178 @@ async def resolve_personal_list_owner_for_interaction(
     return inferred, pl2
 
 
+def _personal_sync_gated_disabled(pl: dict[str, Any]) -> bool:
+    """Пошаговый режим: личный список только после первой синхронизации с Yummy."""
+    return bool(pl.get("hub_onboarding")) and not bool(pl.get("yummy_bulk_sync_done"))
+
+
+def build_personal_topic_hub_view(pl: dict[str, Any] | None) -> "PersonalTopicHubView":
+    if not isinstance(pl, dict):
+        return PersonalTopicHubView(personal_sync_disabled=False)
+    return PersonalTopicHubView(
+        personal_sync_disabled=_personal_sync_gated_disabled(pl),
+    )
+
+
+async def refresh_personal_hub_panel_for_user(
+    client: discord.Client, guild_id: int, user_id: int
+) -> None:
+    """Обновляет embed и кнопки панели (например после синхронизации с Yummy)."""
+    state = await read_state_copy()
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return
+    try:
+        tid = int(pl.get("thread_id") or 0)
+        cid = int(pl.get("control_message_id") or 0)
+    except (TypeError, ValueError):
+        return
+    if not tid or not cid:
+        return
+    guild = client.get_guild(guild_id)
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(guild_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    member = guild.get_member(user_id)
+    display_name = member.display_name if member else str(user_id)
+    thread = client.get_channel(tid)
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(tid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    if not isinstance(thread, discord.Thread):
+        return
+    hub_embed = _personal_hub_embed(pl, display_name)
+    view = build_personal_topic_hub_view(pl)
+    try:
+        msg = await thread.fetch_message(cid)
+        await msg.edit(embed=hub_embed, view=view)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def run_personal_list_sync_from_forum_now(
+    guild: discord.Guild,
+    user_id: int,
+    session: aiohttp.ClientSession | None,
+) -> tuple[int, str | None]:
+    """Личный список из adders основного форума + сразу пересборка карточек (без отложенного refresh)."""
+    n, err = await sync_personal_list_from_anime_topics(guild, user_id)
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return n, "Не удалось получить участника сервера."
+    await ensure_personal_list_thread(bot, guild, member, session=session)
+    await rebuild_personal_list_display(bot, guild.id, user_id, session=session)
+    return n, err
+
+
+class YummyBulkSyncModal(discord.ui.Modal):
+    """Запрос числа позиций Yummy для синхронизации с основным форумом."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(title="Синхронизация с YummyAnime")
+        self._owner_id = owner_id
+        self._count = discord.ui.TextInput(
+            label="Сколько последних позиций обработать (1–1000)",
+            placeholder="100",
+            default="100",
+            max_length=4,
+            required=True,
+        )
+        self.add_item(self._count)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self._owner_id:
+            await interaction.response.send_message("Это не ваш список.", ephemeral=True)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            return
+        raw = (self._count.value or "").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                "Введите **целое число** от **1** до **1000**.", ephemeral=True
+            )
+            return
+        n = max(1, min(1000, n))
+        app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+        if not app:
+            await interaction.response.send_message(
+                "Нет **YUMMY_APPLICATION_TOKEN** у бота.", ephemeral=True
+            )
+            return
+        sess = getattr(interaction.client, "session", None)
+        if not sess:
+            await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            r = await run_yummy_list_import_for_member(
+                interaction.guild,
+                self._owner_id,
+                list_filter="all",
+                max_topics=n,
+                session=sess,
+                app_token=app,
+                skip_imported_entries=False,
+                reconcile_each_step=False,
+                max_merge_ops=15000,
+                max_list_entries=n,
+            )
+        except Exception:
+            logger.exception("YummyBulkSyncModal import")
+            await interaction.followup.send(
+                "Ошибка синхронизации (см. логи бота).", ephemeral=True
+            )
+            return
+        if r.get("error"):
+            await interaction.followup.send(
+                _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
+            )
+            return
+        await _set_personal_list_fields(self._owner_id, yummy_bulk_sync_done=True)
+        try:
+            await refresh_personal_hub_panel_for_user(
+                interaction.client, interaction.guild.id, self._owner_id
+            )
+        except Exception:
+            logger.exception("refresh hub after yummy bulk")
+        lines = [
+            "**Синхронизация с YummyAnime завершена** (первые **"
+            f"{n}** позиций из объединённых списков).",
+            f"**Новых тем** на основном форуме: **{r.get('n_new', 0)}**.",
+            f"**Обработано позиций** (темы): **{r.get('merge_ops', 0)}**.",
+            "",
+            "Теперь нажмите **«Синхронизация личного списка»** на панели, "
+            "чтобы подтянуть аниме **в эту тему**.",
+        ]
+        er = r.get("errors") or []
+        if er:
+            lines.append("Замечания: " + "; ".join(er[:4]))
+        await interaction.followup.send(
+            _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+
+
 class PersonalTopicHubView(discord.ui.View):
     """Постоянные кнопки панели (custom_id фиксированы — работают после перезапуска бота)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, personal_sync_disabled: bool = False) -> None:
         super().__init__(timeout=None)
+        if personal_sync_disabled:
+            for ch in self.children:
+                if getattr(ch, "custom_id", None) == "plist:hub:personal_sync":
+                    ch.disabled = True
+                    break
 
     async def _resolve_owner(
         self, interaction: discord.Interaction
@@ -2273,8 +2597,83 @@ class PersonalTopicHubView(discord.ui.View):
         return await resolve_personal_list_owner_for_interaction(interaction)
 
     @discord.ui.button(
-        label="Обновить",
+        label="Синхронизация с Yummy",
+        style=discord.ButtonStyle.success,
+        emoji="🍱",
+        custom_id="plist:hub:yummy_bulk",
+        row=0,
+    )
+    async def hub_yummy_bulk(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        resolved = await self._resolve_owner(interaction)
+        if not resolved:
+            return
+        owner_id, _pl = resolved
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message(
+                "Только **владелец** может синхронизировать YummyAnime.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(YummyBulkSyncModal(owner_id))
+
+    @discord.ui.button(
+        label="Синхронизация личного списка",
         style=discord.ButtonStyle.primary,
+        emoji="📥",
+        custom_id="plist:hub:personal_sync",
+        row=0,
+    )
+    async def hub_personal_sync(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        resolved = await self._resolve_owner(interaction)
+        if not resolved:
+            return
+        owner_id, pl = resolved
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message(
+                "Только **владелец** может синхронизировать список.", ephemeral=True
+            )
+            return
+        if not interaction.guild:
+            return
+        if _personal_sync_gated_disabled(pl):
+            await interaction.response.send_message(
+                "Сначала завершите **«Синхронизация с Yummy»** (модальное окно с числом позиций) "
+                "и дождитесь окончания. Потом эта кнопка разблокируется.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        sess = getattr(interaction.client, "session", None)
+        try:
+            n, err = await run_personal_list_sync_from_forum_now(
+                interaction.guild, owner_id, sess
+            )
+        except Exception:
+            logger.exception("hub_personal_sync")
+            await interaction.followup.send(
+                "Ошибка при синхронизации личного списка.", ephemeral=True
+            )
+            return
+        msg = f"Личный список обновлён из **основного форума** (**{n}** позиций в данных)."
+        if err:
+            msg += f"\n_{err}_"
+        await _set_personal_list_fields(owner_id, hub_onboarding=False)
+        try:
+            await refresh_personal_hub_panel_for_user(
+                interaction.client, interaction.guild.id, owner_id
+            )
+        except Exception:
+            logger.exception("refresh hub after personal sync")
+        await interaction.followup.send(
+            _truncate(msg, DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Обновить",
+        style=discord.ButtonStyle.secondary,
         emoji="🔄",
         custom_id="plist:hub:ref",
         row=0,
@@ -2302,7 +2701,7 @@ class PersonalTopicHubView(discord.ui.View):
             logger.exception("plist hub refresh")
             await interaction.followup.send("Ошибка при обновлении.", ephemeral=True)
             return
-        await interaction.followup.send("Карточки пересобраны.", ephemeral=True)
+        await interaction.followup.send("Карточки пересобраны из базы бота.", ephemeral=True)
 
     @discord.ui.button(
         label="Тема",
@@ -2335,10 +2734,10 @@ class PersonalTopicHubView(discord.ui.View):
         mem = interaction.guild.get_member(owner_id) if interaction.guild else None
         dn = mem.display_name if mem else str(owner_id)
         hub_embed = _personal_hub_embed(pl2 if isinstance(pl2, dict) else pl, dn)
+        plv = pl2 if isinstance(pl2, dict) else pl
+        view = build_personal_topic_hub_view(plv if isinstance(plv, dict) else None)
         try:
-            await interaction.response.edit_message(
-                embed=hub_embed, view=PersonalTopicHubView()
-            )
+            await interaction.response.edit_message(embed=hub_embed, view=view)
             await interaction.followup.send(
                 f"Акцент `#{nxt:06x}`. Нажми **Обновить**, чтобы перекрасить карточки.",
                 ephemeral=True,
@@ -2350,84 +2749,11 @@ class PersonalTopicHubView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Yummy «Просмотрено»",
-        style=discord.ButtonStyle.success,
-        emoji="🍱",
-        custom_id="plist:hub:yummy",
-        row=0,
-    )
-    async def hub_yummy_sync(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        resolved = await self._resolve_owner(interaction)
-        if not resolved:
-            return
-        owner_id, _pl = resolved
-        if interaction.user.id != owner_id:
-            await interaction.response.send_message(
-                "Только **владелец** может синхронизировать YummyAnime.", ephemeral=True
-            )
-            return
-        if not interaction.guild:
-            return
-        app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
-        if not app:
-            await interaction.response.send_message(
-                "Синхронизация Yummy отключена: нет **YUMMY_APPLICATION_TOKEN** на стороне бота.",
-                ephemeral=True,
-            )
-            return
-        sess = getattr(interaction.client, "session", None)
-        if not sess:
-            await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            r = await run_yummy_list_import_for_member(
-                interaction.guild,
-                owner_id,
-                list_filter="completed",
-                max_topics=25,
-                session=sess,
-                app_token=app,
-            )
-        except Exception:
-            logger.exception("plist hub yummy sync")
-            await interaction.followup.send(
-                "Ошибка при синхронизации YummyAnime.", ephemeral=True
-            )
-            return
-        if r.get("error"):
-            await interaction.followup.send(
-                _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
-            )
-            return
-        lines = [
-            "Источник YummyAnime: **только «Просмотрено»**.",
-            f"**Новых тем:** **{r.get('n_new', 0)}**",
-            f"**Дописано в существующие:** **{r.get('merge_ops', 0)}**",
-        ]
-        cr = r.get("created_urls") or []
-        if cr:
-            lines.append("Новые: " + ", ".join(cr[:6]))
-            if len(cr) > 6:
-                lines.append(f"_…ещё {len(cr) - 6}_")
-        mer = r.get("merged_urls") or []
-        if mer:
-            lines.append("Объединено: " + ", ".join(mer[:4]))
-        er = r.get("errors") or []
-        if er:
-            lines.append("Замечания: " + "; ".join(er[:3]))
-        await interaction.followup.send(
-            _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
-        )
-
-    @discord.ui.button(
         label="Экспорт .txt",
         style=discord.ButtonStyle.secondary,
         emoji="📤",
         custom_id="plist:hub:exp",
-        row=0,
+        row=1,
     )
     async def hub_export(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -2628,22 +2954,33 @@ def _personal_hub_embed(pl: dict[str, Any], display_name: str) -> discord.Embed:
         accent = EMBED_COLOR
     nums = "вкл." if pl.get("show_numbers") else "выкл."
     comp = "вкл." if pl.get("compact_cards") else "выкл."
-    e = discord.Embed(
-        title="🎛️ Личный список",
-        description=(
-            f"**{display_name}**\n\n"
-            "· **Обновить** — пересобрать карточки из базы бота.\n"
-            "· **Yummy «Просмотрено»** — добавить на сервер только аниме из этого списка на YummyAnime.\n"
-            "· **Экспорт .txt** — полный список файлом.\n"
-            "· **Тема** — цвет карточек, затем снова **Обновить**.\n\n"
+    if pl.get("hub_onboarding"):
+        desc = (
+            f"**{display_name}** · **первый запуск**\n\n"
+            "1. В **любом чате** сервера: **`/yummy_link`** — привязка аккаунта YummyAnime.\n"
+            "2. **Синхронизация с Yummy** — сколько последних позиций обработать (**1–1000**); дождитесь окончания.\n"
+            "3. **Синхронизация личного списка** (станет доступна после шага 2) — подтянуть в эту тему аниме "
+            "из **основного форума** после импорта с Yummy.\n\n"
+            "**Обновить** — пересобрать карточки из **локальной базы** бота (без API Yummy).\n"
+            "**Экспорт .txt** · **Тема** (цвет карточек) — затем снова **Обновить**.\n\n"
             "Синхронизация с ветками основного форума: **`/mylist_admin_sync`** (админ). "
-            f"Нумерация и компакт в данных: **нумерация {nums}**, **компакт {comp}**.\n"
-            "Полный импорт без лимита: **`/yummy_sync`**. Раз в **7 дней**: **`/mylist_yummy_weekly`** "
-            "(все списки Yummy + проверка дубликатов в личном списке). "
-            "В названии темы — число **просмотренных** по Yummy (**✓N**), если аккаунт привязан."
-        ),
-        color=accent,
-    )
+            f"В данных: **нумерация {nums}**, **компакт {comp}**.\n"
+            "Полный импорт: **`/yummy_sync`**. Раз в **7 дней**: **`/mylist_yummy_weekly`**.\n"
+            "В названии темы — **✓N** просмотренных по Yummy, если аккаунт привязан."
+        )
+    else:
+        desc = (
+            f"**{display_name}**\n\n"
+            "· **Синхронизация с Yummy** — импорт с сайта в **основной форум** (число последних позиций **1–1000**).\n"
+            "· **Синхронизация личного списка** — подтянуть в эту тему позиции из основного форума (после импорта с Yummy).\n"
+            "· **Обновить** — пересобрать карточки из **локальной базы** бота (без запросов к YummyAnime).\n"
+            "· **Экспорт .txt** · **Тема** — цвет карточек, затем снова **Обновить**.\n\n"
+            "Синхронизация с ветками основного форума: **`/mylist_admin_sync`** (админ). "
+            f"**Нумерация {nums}**, **компакт {comp}**.\n"
+            "Полный импорт: **`/yummy_sync`**. Раз в **7 дней**: **`/mylist_yummy_weekly`**.\n"
+            "В названии темы — **✓N** просмотренных по Yummy, если аккаунт привязан."
+        )
+    e = discord.Embed(title="🎛️ Личный список", description=desc, color=accent)
     e.set_footer(text="Только владелец может нажимать кнопки.")
     return e
 
@@ -2692,6 +3029,19 @@ def _starter_looks_like_personal_list(content: str, user_id: int) -> bool:
         return False
     uid_s = str(user_id)
     return f"<@{uid_s}>" in content or f"<@!{uid_s}>" in content
+
+
+def _new_animelist_starter_content(mention: str) -> str:
+    return (
+        f"{mention} — **личный список аниме**.\n\n"
+        "**Первый раз — по шагам:**\n"
+        "1. В **любом чате** сервера выполните **`/yummy_link`** и привяжите аккаунт YummyAnime.\n"
+        "2. Нажмите **«Синхронизация с Yummy»** на панели внизу темы и укажите число последних позиций (**1–1000**). "
+        "Дождитесь окончания.\n"
+        "3. Нажмите **«Синхронизация личного списка»** — в эту тему подтянутся аниме из **основного форума**.\n\n"
+        "Дальше: **`/mylist_edit`**, **`/mylist_top`**. Кнопка **Обновить** на панели пересобирает карточки из базы бота.\n\n"
+        "_По одному сообщению на каждое аниме._"
+    )
 
 
 async def _find_existing_personal_list_thread(
@@ -3110,7 +3460,7 @@ async def rebuild_personal_list_display(
             pass
         await asyncio.sleep(DISCORD_LIST_DELETE_DELAY_SEC)
 
-    hub_view = PersonalTopicHubView()
+    hub_view = build_personal_topic_hub_view(pl)
     ctrl_id = pl.get("control_message_id")
     hub_embed = _personal_hub_embed(pl, display_name)
     if ctrl_id:
@@ -3200,6 +3550,7 @@ async def ensure_personal_list_thread(
     member: discord.Member,
     *,
     session: aiohttp.ClientSession | None,
+    starter_content: str | None = None,
 ) -> discord.Thread | None:
     """Одна тема LIST_FORUM на пользователя; защита от гонок и «битого» thread_id в базе."""
     uid = member.id
@@ -3303,6 +3654,8 @@ async def ensure_personal_list_thread(
             "Панель управления и карточки появятся ниже после первого обновления списка.\n\n"
             "_По одному сообщению на каждое аниме._"
         )
+        if starter_content is not None:
+            intro = _truncate(starter_content, 2000)
         try:
             twm = await forum.create_thread(name=name, content=intro)
             thread = twm.thread
@@ -3372,6 +3725,7 @@ async def sync_personal_list_from_anime_topics(
             ks = str(key).strip()
             if ks:
                 keys_list.append(ks)
+        keys_list = _dedupe_personal_keys_by_thread(keys_list, topics)
         keys_set = set(keys_list)
         uid = str(target_id)
         pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
@@ -3453,6 +3807,7 @@ async def run_yummy_list_import_for_member(
     skip_imported_entries: bool = True,
     reconcile_each_step: bool = True,
     max_merge_ops: int = CONNECT_MAX_MERGES_PER_RUN,
+    max_list_entries: int | None = None,
 ) -> dict[str, Any]:
     """Новые позиции из API YummyAnime → основной форум и личный список."""
     empty: dict[str, Any] = {
@@ -3490,6 +3845,13 @@ async def run_yummy_list_import_for_member(
         await update_yummy_access_token(discord_user_id, new_tok)
 
     entries = yummy_api.filter_yummy_entries_by_status(items or [], list_filter)
+    if max_list_entries is not None:
+        try:
+            lim_e = int(max_list_entries)
+        except (TypeError, ValueError):
+            lim_e = 0
+        lim_e = max(1, min(1000, lim_e))
+        entries = entries[:lim_e]
 
     raw_imp = state.get("imported_yummy", {}).get(str(discord_user_id), [])
     imported_ids: set[int] = set()
@@ -6041,7 +6403,7 @@ def _build_admin_diagnostics_embed() -> discord.Embed:
 
 admin_cmd_group = app_commands.Group(
     name="admin",
-    description="Админ: диагностика, YummyAnime, скан форума, личные списки, справка, ремонт тем",
+    description="Админ: диагностика, очистка данных пользователя, Yummy, скан форума, справка, ремонт тем",
 )
 
 
@@ -6189,6 +6551,64 @@ async def admin_diagnostics(interaction: discord.Interaction) -> None:
         return
     await interaction.response.send_message(
         embed=_build_admin_diagnostics_embed(), ephemeral=True
+    )
+
+
+@admin_cmd_group.command(
+    name="purge_user_data",
+    description="Удалить из базы бота все данные участника (привязки, личный список, adders, оценки)",
+)
+@app_commands.describe(
+    member="Участник, чьи данные удалить",
+    confirm="Введите точно: PURGE (иначе команда не выполнится)",
+)
+async def admin_purge_user_data(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    confirm: str,
+) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    if (confirm or "").strip().upper() != "PURGE":
+        await interaction.response.send_message(
+            "Для подтверждения в параметре **confirm** укажите ровно **`PURGE`** (заглавными).",
+            ephemeral=True,
+        )
+        return
+    assert interaction.guild is not None
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        stats = await purge_discord_user_bot_data(interaction.guild.id, member.id)
+    except Exception:
+        logger.exception("admin purge_user_data %s", member.id)
+        await interaction.followup.send(
+            "Ошибка при очистке (см. логи бота).", ephemeral=True
+        )
+        return
+    lines = [
+        f"Данные **{member.display_name}** (`{member.id}`) очищены в **mal_state** "
+        f"(и в **yummy_link_state**, если были сессии привязки).",
+        "",
+        f"· Личный список: **{'удалён' if stats['personal_list'] else 'не было'}**",
+        f"· Yummy-привязка: **{'снята' if stats['yummy_account'] else 'не было'}** · "
+        f"MAL-привязка: **{'снята' if stats['mal_account'] else 'не было'}**",
+        f"· Сброшены списки импорта Yummy/MAL: **{stats['imported_yummy'] + stats['imported_mal']}**",
+        f"· Тем основного форума (убран из adders): **{stats['anime_topics_adders_cleared']}**",
+        f"· Оценки в темах: **{stats['ratings_removed']}** записей",
+        f"· Yummy link (ready/pending): **{stats['yummy_link_ready']}** / **{stats['yummy_link_pending']}**",
+        "",
+        "_Тексты первых постов в темах форума бот не меняет — при необходимости поправьте вручную или через ремонт тем._",
+    ]
+    logger.info(
+        "purge_user_data: target=%s by=%s stats=%s",
+        member.id,
+        interaction.user.id,
+        stats,
+    )
+    await interaction.followup.send(
+        _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
     )
 
 
@@ -6435,7 +6855,7 @@ async def adminpanel(interaction: discord.Interaction) -> None:
         title="Админ-панель",
         description=(
             "Меню слева — быстрые действия.\n"
-            "Ещё: **`/admin diagnostics`**, **`/admin refresh_help_thread`**, "
+            "Ещё: **`/admin diagnostics`**, **`/admin purge_user_data`**, **`/admin refresh_help_thread`**, "
             "**`/admin personal_rebuild`**, **`/admin yummy_resync`**, **`/admin yummy_status`**."
         ),
         color=EMBED_COLOR,
@@ -6587,7 +7007,9 @@ async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
     hub_embed = _personal_hub_embed(pl, interaction.user.display_name)
     try:
-        hub_msg = await ch.send(embed=hub_embed, view=PersonalTopicHubView())
+        hub_msg = await ch.send(
+            embed=hub_embed, view=build_personal_topic_hub_view(pl)
+        )
     except discord.HTTPException as e:
         await interaction.followup.send(f"Не удалось отправить панель: {e}", ephemeral=True)
         return
@@ -6604,6 +7026,94 @@ async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
 )
 async def mylist_panel(interaction: discord.Interaction) -> None:
     await _mylist_panel_impl(interaction)
+
+
+@bot.tree.command(
+    name="newanimelist",
+    description="[Мой список] Создать личную тему и пошаговую инструкцию (сначала /yummy_link)",
+)
+async def newanimelist(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    uid = interaction.user.id
+    client = interaction.client
+    state = await read_state_copy()
+    pl0 = (state.get("personal_lists") or {}).get(str(uid))
+    if isinstance(pl0, dict):
+        try:
+            tid = int(pl0.get("thread_id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        if tid:
+            ch = client.get_channel(tid)
+            if ch is None:
+                try:
+                    ch = await client.fetch_channel(tid)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    ch = None
+            if (
+                isinstance(ch, discord.Thread)
+                and ch.parent_id == LIST_FORUM_CHANNEL_ID
+            ):
+                await interaction.response.send_message(
+                    "У вас уже есть личная тема в форуме списков: "
+                    f"{ch.jump_url}\n\n"
+                    "1. **`/yummy_link`** в любом чате\n"
+                    "2. **Синхронизация с Yummy** на панели (1–1000 позиций)\n"
+                    "3. **Синхронизация личного списка**\n\n"
+                    "Если панели нет — **`/mylist_panel`** из этой темы.",
+                    ephemeral=True,
+                )
+                return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        m2 = interaction.guild.get_member(uid)
+        if m2 is None:
+            try:
+                m2 = await interaction.guild.fetch_member(uid)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                m2 = None
+        if m2 is None:
+            await interaction.followup.send(
+                "Не удалось получить ваш профиль на сервере.", ephemeral=True
+            )
+            return
+        member = m2
+    sess = getattr(client, "session", None)
+    thread = await ensure_personal_list_thread(
+        client,
+        interaction.guild,
+        member,
+        session=sess,
+        starter_content=_new_animelist_starter_content(member.mention),
+    )
+    if thread is None:
+        await interaction.followup.send(
+            "Не удалось создать личную тему (права бота или канал форума списков).",
+            ephemeral=True,
+        )
+        return
+    await _set_personal_list_fields(
+        uid,
+        hub_onboarding=True,
+        yummy_bulk_sync_done=False,
+    )
+    try:
+        await rebuild_personal_list_display(
+            client, interaction.guild.id, uid, session=sess
+        )
+    except Exception:
+        logger.exception("newanimelist: rebuild_personal_list_display")
+    await interaction.followup.send(
+        "Готово. Откройте тему: "
+        f"{thread.jump_url}\n\n"
+        "Сначала выполните **`/yummy_link`**, затем следуйте панели в теме.",
+        ephemeral=True,
+    )
 
 
 async def _mylist_edit_impl(
