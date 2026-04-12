@@ -1,6 +1,7 @@
 """
 Discord bot: YummyAnime основной форум (/animeadd), личные списки в LIST_FORUM_CHANNEL_ID,
-/animelist и /checkanime по сохранённым данным, /myanimelist (MAL), /update_topics.
+/animelist и /checkanime по сохранённым данным, /myanimelist (MAL), /yummybind + /syncyummy (API),
+фоновый опрос Yummy, /admin и /adminpanel, /update_topics.
 Справочная ветка: BOT_INFO_THREAD_ID. Токен: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
 """
 
@@ -21,6 +22,7 @@ from urllib.parse import quote
 
 import aiohttp
 import discord
+import yummy_api
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
@@ -474,9 +476,11 @@ _state_lock = asyncio.Lock()
 def _default_state() -> dict[str, Any]:
     return {
         "mal_accounts": {},
+        "yummy_accounts": {},
+        "imported_mal": {},
+        "imported_yummy": {},
         "threads": {},
         "ratings": {},
-        "imported_mal": {},
         "anime_topics": {},
         "personal_lists": {},
         "slug_titles": {},
@@ -497,9 +501,11 @@ def _load_state() -> dict[str, Any]:
         return _default_state()
     for key in (
         "mal_accounts",
+        "yummy_accounts",
         "threads",
         "ratings",
         "imported_mal",
+        "imported_yummy",
         "anime_topics",
         "personal_lists",
         "slug_titles",
@@ -734,6 +740,93 @@ async def mark_mal_imported(discord_user_id: int, mal_id: int) -> None:
             cur.append(mal_id)
         data["imported_mal"][key] = cur
         _write_state(data)
+
+
+async def bind_yummy_account(
+    discord_user_id: int,
+    access_token: str,
+    yummy_user_id: int,
+    nickname: str = "",
+) -> None:
+    async with _state_lock:
+        data = _load_state()
+        data.setdefault("yummy_accounts", {})[str(discord_user_id)] = {
+            "access_token": access_token.strip(),
+            "yummy_user_id": int(yummy_user_id),
+            "nickname": (nickname or "").strip(),
+        }
+        _write_state(data)
+
+
+async def update_yummy_access_token(discord_user_id: int, new_token: str) -> None:
+    async with _state_lock:
+        data = _load_state()
+        key = str(discord_user_id)
+        acc = data.get("yummy_accounts", {}).get(key)
+        if not isinstance(acc, dict):
+            return
+        acc["access_token"] = new_token.strip()
+        data.setdefault("yummy_accounts", {})[key] = acc
+        _write_state(data)
+
+
+async def unbind_yummy_account(discord_user_id: int) -> None:
+    async with _state_lock:
+        data = _load_state()
+        data.setdefault("yummy_accounts", {}).pop(str(discord_user_id), None)
+        _write_state(data)
+
+
+async def mark_yummy_imported(discord_user_id: int, anime_id: int) -> None:
+    async with _state_lock:
+        data = _load_state()
+        key = str(discord_user_id)
+        cur = data.setdefault("imported_yummy", {}).get(key)
+        if not isinstance(cur, list):
+            cur = []
+        if anime_id not in cur:
+            cur.append(anime_id)
+        data["imported_yummy"][key] = cur
+        _write_state(data)
+
+
+def _is_bot_admin(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    rid = (os.environ.get("DISCORD_ADMIN_ROLE_ID") or "").strip()
+    if not rid or not member.guild:
+        return False
+    try:
+        role = member.guild.get_role(int(rid))
+    except ValueError:
+        return False
+    return bool(role and role in member.roles)
+
+
+def _primary_guild_for_yummy_poll() -> discord.Guild | None:
+    gid = (os.environ.get("DISCORD_GUILD_ID") or "").strip()
+    if gid:
+        try:
+            g = bot.get_guild(int(gid))
+            if g:
+                return g
+        except ValueError:
+            pass
+    return bot.guilds[0] if bot.guilds else None
+
+
+def _admin_member_ok(interaction: discord.Interaction) -> tuple[bool, str | None]:
+    if not interaction.guild:
+        return False, "Команду можно использовать только на сервере."
+    user = interaction.user
+    if not isinstance(user, discord.Member):
+        return False, "Не удалось определить участника."
+    if not _is_bot_admin(user):
+        return (
+            False,
+            "Нужны права **администратора** сервера или роль из **DISCORD_ADMIN_ROLE_ID**.",
+        )
+    return True, None
 
 
 async def read_state_copy() -> dict[str, Any]:
@@ -1202,8 +1295,12 @@ def _build_bot_commands_embed() -> discord.Embed:
         ("`/mytopicpanel`", "Снова вывести панель кнопок в личной теме (после сбоев)."),
         ("`/malbind`", "Привязать/перепривязать ссылку MAL (делается один раз, потом по необходимости)."),
         ("`/connectmyanimelist`", "Импортировать из привязанного MAL в основной форум."),
+        ("`/yummybind` / `/yummyunbind`", "Привязать Bearer-токен YummyAnime (из DevTools после входа на сайт) / отвязать."),
+        ("`/syncyummy`", "Импорт **новых** позиций из вашего списка YummyAnime в основной форум и личный топик."),
         ("`/myanimelist` и `/checkanimelist`", "Показать MAL-список с сайта (ваш или выбранного участника)."),
         ("`/syncmylist` (`/syncanimelist`)", "**Админы:** пересобрать личный список участника из тем основного форума."),
+        ("`/admin` …", "**Админы:** подкоманды `yummy_resync`, `yummy_status`, `forum_scan`, `personal_rebuild`, `repair_topics`."),
+        ("`/adminpanel`", "**Админы:** меню быстрых действий (статус Yummy, скан форума, обновление тем)."),
         ("`/rateanime`", "Оценка 1–10 в теме **основного** форума с аниме (или кнопка «Оценить»)."),
         ("`/checkduplicates`", "Дубликаты тем основного форума и удаление лишних."),
         ("`/update_topics`", "**Админы:** догнать старые темы основного форума — реакции, панели, карточку."),
@@ -1676,6 +1773,7 @@ class PersonalTopicHubView(discord.ui.View):
             "· `/settopanime` — закрепить топ-5 (звезда на карточке).\n"
             "· `/editmyanimelist` — название темы и первый пост.\n"
             "· **Синхронизировать** — как `/syncanimelist` для вас: парсинг основного форума + список в теме.\n"
+            "· **Yummy ↻** — подтянуть новые тайтлы из вашего списка на YummyAnime (нужны `/yummybind` и токен приложения у бота).\n"
             "· **Экспорт** — Markdown-список с ссылками (только вам).\n"
             "· `/mytopicpanel` — восстановить панель после сбоев.\n"
             "· Jikan — публичный API; при лимитах постер MAL может не подгрузиться.\n"
@@ -1739,6 +1837,78 @@ class PersonalTopicHubView(discord.ui.View):
         await interaction.followup.send(
             _truncate("\n".join(parts), DISCORD_CONTENT_LIMIT),
             ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Yummy ↻",
+        style=discord.ButtonStyle.primary,
+        emoji="🍱",
+        custom_id="plist:hub:yummy",
+        row=2,
+    )
+    async def hub_yummy_sync(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        resolved = await self._resolve_owner(interaction)
+        if not resolved:
+            return
+        owner_id, _pl = resolved
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message(
+                "Только **владелец** может синхронизировать YummyAnime.", ephemeral=True
+            )
+            return
+        if not interaction.guild:
+            return
+        app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+        if not app:
+            await interaction.response.send_message(
+                "Синхронизация Yummy отключена: нет **YUMMY_APPLICATION_TOKEN** на стороне бота.",
+                ephemeral=True,
+            )
+            return
+        sess = getattr(interaction.client, "session", None)
+        if not sess:
+            await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            r = await run_yummy_list_import_for_member(
+                interaction.guild,
+                owner_id,
+                list_filter="all",
+                max_topics=25,
+                session=sess,
+                app_token=app,
+            )
+        except Exception:
+            logger.exception("plist hub yummy sync")
+            await interaction.followup.send(
+                "Ошибка при синхронизации YummyAnime.", ephemeral=True
+            )
+            return
+        if r.get("error"):
+            await interaction.followup.send(
+                _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
+            )
+            return
+        lines = [
+            f"**Новых тем:** **{r.get('n_new', 0)}**",
+            f"**Дописано в существующие:** **{r.get('merge_ops', 0)}**",
+        ]
+        cr = r.get("created_urls") or []
+        if cr:
+            lines.append("Новые: " + ", ".join(cr[:6]))
+            if len(cr) > 6:
+                lines.append(f"_…ещё {len(cr) - 6}_")
+        mer = r.get("merged_urls") or []
+        if mer:
+            lines.append("Объединено: " + ", ".join(mer[:4]))
+        er = r.get("errors") or []
+        if er:
+            lines.append("Замечания: " + "; ".join(er[:3]))
+        await interaction.followup.send(
+            _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
         )
 
     @discord.ui.button(
@@ -2297,6 +2467,274 @@ async def sync_personal_list_from_anime_topics(
     return len(keys), None
 
 
+async def run_yummy_list_import_for_member(
+    guild: discord.Guild,
+    discord_user_id: int,
+    *,
+    list_filter: str,
+    max_topics: int,
+    session: aiohttp.ClientSession,
+    app_token: str,
+) -> dict[str, Any]:
+    """Новые позиции из API YummyAnime → основной форум и личный список."""
+    empty: dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "n_new": 0,
+        "merge_ops": 0,
+        "merged_urls": [],
+        "created_urls": [],
+        "errors": [],
+    }
+    state = await read_state_copy()
+    acc = (state.get("yummy_accounts") or {}).get(str(discord_user_id))
+    if not isinstance(acc, dict):
+        empty["error"] = "Аккаунт YummyAnime не привязан (`/yummybind`)."
+        return empty
+    yuid = acc.get("yummy_user_id")
+    bearer = (acc.get("access_token") or "").strip()
+    if yuid is None or not bearer:
+        empty["error"] = "Неполная привязка YummyAnime."
+        return empty
+    try:
+        yuid_i = int(yuid)
+    except (TypeError, ValueError):
+        empty["error"] = "Некорректный yummy_user_id в базе."
+        return empty
+
+    items, new_tok, err_msg = await yummy_api.yani_fetch_lists_with_token_refresh(
+        session, app_token, bearer, yuid_i, USER_AGENT
+    )
+    if err_msg:
+        empty["error"] = err_msg
+        return empty
+    if new_tok:
+        await update_yummy_access_token(discord_user_id, new_tok)
+
+    entries = yummy_api.filter_yummy_entries_by_status(items or [], list_filter)
+
+    raw_imp = state.get("imported_yummy", {}).get(str(discord_user_id), [])
+    imported_ids: set[int] = set()
+    if isinstance(raw_imp, list):
+        for x in raw_imp:
+            try:
+                imported_ids.add(int(x))
+            except (TypeError, ValueError):
+                continue
+
+    forum = await resolve_forum_channel(bot)
+    if not forum:
+        empty["error"] = "Канал основного форума не найден."
+        return empty
+
+    uid = discord_user_id
+    created_urls: list[str] = []
+    merged_urls: list[str] = []
+    errors: list[str] = []
+    n_new = 0
+    merge_ops = 0
+
+    for entry in entries:
+        if n_new >= max_topics:
+            break
+        aid = yummy_api.yummy_entry_anime_id(entry)
+        if aid is None:
+            continue
+        if aid in imported_ids:
+            continue
+
+        err: str | None = None
+        thread: discord.Thread | None = None
+
+        query = yummy_api.yummy_entry_title(entry)
+        slug_raw = yummy_api.yummy_entry_anime_url(entry)
+        slug = _clean_slug(slug_raw) if slug_raw else ""
+        if not slug:
+            slug = await api_search_slug(session, query) or ""
+        info = await api_fetch_anime(session, slug) if slug else None
+
+        rem = entry.get("remote_ids") if isinstance(entry.get("remote_ids"), dict) else {}
+        mal_ref = rem.get("myanimelist_id")
+        mal_id_opt: int | None
+        try:
+            mal_id_opt = (
+                int(mal_ref)
+                if mal_ref is not None and str(mal_ref).strip() != ""
+                else None
+            )
+        except (TypeError, ValueError):
+            mal_id_opt = None
+
+        if info:
+            slug_key = _clean_slug((info.get("anime_url") or "").strip())
+            thread, mst = await merge_adder_into_existing_topic(bot, slug_key, uid)
+            if mst == "merged":
+                await mark_yummy_imported(uid, aid)
+                imported_ids.add(aid)
+                merge_ops += 1
+                if thread:
+                    ju = (
+                        thread.jump_url
+                        if hasattr(thread, "jump_url")
+                        else f"<#{thread.id}>"
+                    )
+                    merged_urls.append(ju)
+                    try:
+                        tnm = thread.name[:200] if thread else query
+                        await append_user_anime_to_personal_state(
+                            guild, uid, slug_key, tnm
+                        )
+                    except Exception:
+                        logger.exception("Личный список после merge Yummy→Discord")
+                if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
+                    errors.append(
+                        "Достигнут лимит дописываний за один запуск; запустите снова."
+                    )
+                    break
+                await asyncio.sleep(0.35)
+                continue
+            if mst == "already":
+                await mark_yummy_imported(uid, aid)
+                imported_ids.add(aid)
+                merge_ops += 1
+                try:
+                    await append_user_anime_to_personal_state(
+                        guild, uid, slug_key, query[:500]
+                    )
+                except Exception:
+                    logger.exception("Личный список после already Yummy")
+                if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
+                    errors.append(
+                        "Достигнут лимит дописываний за один запуск; запустите снова."
+                    )
+                    break
+                continue
+            if mst in ("edit_failed", "fetch_failed"):
+                errors.append(f"{query}: не удалось обновить существующую тему")
+                continue
+
+            thread, _st, err = await create_yummy_forum_thread(
+                forum,
+                session,
+                info,
+                uid,
+                mal_id=mal_id_opt,
+                resolved_slug=slug or "",
+            )
+        else:
+            errors.append(
+                f"{query}: нет карточки en.yummyani.me для slug `{slug or '—'}`"
+            )
+            continue
+
+        if err:
+            errors.append(f"{query}: {err}")
+            continue
+        if not thread:
+            errors.append(f"{query}: неизвестная ошибка")
+            continue
+
+        try:
+            pk = _clean_slug((info.get("anime_url") or "").strip())
+            pt = str(info.get("title") or query)[:500]
+            await append_user_anime_to_personal_state(guild, uid, pk, pt)
+        except Exception:
+            logger.exception("Личный список после новой темы Yummy import")
+
+        await mark_yummy_imported(uid, aid)
+        imported_ids.add(aid)
+        n_new += 1
+        ju = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
+        created_urls.append(ju)
+        schedule_personal_list_refresh(guild.id, uid)
+        await asyncio.sleep(1.25)
+
+    return {
+        "ok": True,
+        "error": None,
+        "n_new": n_new,
+        "merge_ops": merge_ops,
+        "merged_urls": merged_urls,
+        "created_urls": created_urls,
+        "errors": errors,
+    }
+
+
+async def _write_yummy_poll_meta(
+    *,
+    users_checked: int,
+    total_new: int,
+    errors: list[str],
+) -> None:
+    from datetime import datetime, timezone
+
+    async with _state_lock:
+        data = _load_state()
+        meta = data.setdefault("meta", {})
+        meta["yummy_poll"] = {
+            "last_run_utc": datetime.now(timezone.utc).isoformat(),
+            "users_checked": users_checked,
+            "imports_new": total_new,
+            "errors": errors[:8],
+        }
+        _write_state(data)
+
+
+async def yummy_background_poll_loop() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        interval = max(
+            60,
+            int((os.environ.get("YUMMY_SYNC_INTERVAL_SEC") or "600").strip() or "600"),
+        )
+        app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+        if app and bot.session:
+            g = _primary_guild_for_yummy_poll()
+            if g:
+                state = await read_state_copy()
+                accounts = state.get("yummy_accounts") or {}
+                err_buf: list[str] = []
+                n_checked = 0
+                total_new = 0
+                for uid_s, acc in accounts.items():
+                    if not isinstance(acc, dict):
+                        continue
+                    try:
+                        duid = int(uid_s)
+                    except ValueError:
+                        continue
+                    if not g.get_member(duid):
+                        continue
+                    n_checked += 1
+                    try:
+                        r = await run_yummy_list_import_for_member(
+                            g,
+                            duid,
+                            list_filter="all",
+                            max_topics=15,
+                            session=bot.session,
+                            app_token=app,
+                        )
+                        if r.get("error"):
+                            err_buf.append(f"{duid}: {r['error']}")
+                        else:
+                            total_new += int(r.get("n_new") or 0)
+                    except Exception as e:
+                        logger.exception("yummy poll user %s", duid)
+                        err_buf.append(f"{duid}: {e}")
+                try:
+                    await _write_yummy_poll_meta(
+                        users_checked=n_checked,
+                        total_new=total_new,
+                        errors=err_buf,
+                    )
+                except Exception:
+                    logger.exception("yummy poll meta")
+        await asyncio.sleep(interval)
+        if bot.is_closed():
+            break
+
+
 async def create_yummy_forum_thread(
     forum: discord.ForumChannel,
     session: aiohttp.ClientSession,
@@ -2849,6 +3287,7 @@ class YummyBot(commands.Bot):
         intents.message_content = _mc not in ("0", "false", "no", "off")
         super().__init__(command_prefix="!", intents=intents)
         self.session: aiohttp.ClientSession | None = None
+        self._yummy_poll_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
@@ -3071,6 +3510,9 @@ async def on_ready() -> None:
         await ensure_bot_info_thread(bot)
     except Exception as e:
         logger.warning("Справочная тема форума: %s", e)
+    t = bot._yummy_poll_task
+    if t is None or t.done():
+        bot._yummy_poll_task = asyncio.create_task(yummy_background_poll_loop())
 
 
 @bot.event
@@ -3716,6 +4158,466 @@ async def syncanimelist(interaction: discord.Interaction, member: discord.Member
 @app_commands.default_permissions(administrator=True)
 async def syncmylist(interaction: discord.Interaction, member: discord.Member) -> None:
     await syncanimelist(interaction, member)
+
+
+@bot.tree.command(
+    name="yummybind",
+    description="Привязать аккаунт YummyAnime (Bearer-токен из браузера после входа на сайт)",
+)
+@app_commands.describe(
+    bearer_token="Токен: вкладка Сеть (Network) → любой запрос к api.yani.tv → Authorization: Bearer …"
+)
+async def yummybind(interaction: discord.Interaction, bearer_token: str) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.followup.send(
+            "Владелец бота должен задать **YUMMY_APPLICATION_TOKEN** (приложение на yummyani.me/dev).",
+            ephemeral=True,
+        )
+        return
+    t = (bearer_token or "").strip()
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    if len(t) < 12:
+        await interaction.followup.send("Токен слишком короткий.", ephemeral=True)
+        return
+    if not bot.session:
+        await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
+        return
+    prof = await yummy_api.yani_get_profile(bot.session, app, t, USER_AGENT)
+    if not prof:
+        await interaction.followup.send(
+            "Не удалось получить профиль. Проверьте токен (скопируйте только часть после `Bearer `).",
+            ephemeral=True,
+        )
+        return
+    yid = prof.get("id")
+    if yid is None:
+        await interaction.followup.send("Ответ API без id пользователя.", ephemeral=True)
+        return
+    try:
+        yid_i = int(yid)
+    except (TypeError, ValueError):
+        await interaction.followup.send("Некорректный id в ответе API.", ephemeral=True)
+        return
+    nick = str(prof.get("nickname") or "")
+    await bind_yummy_account(interaction.user.id, t, yid_i, nick)
+    await interaction.followup.send(
+        f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/syncyummy` или кнопка **Yummy ↻** в личной теме.\n"
+        "_Токен хранится на сервере с ботом; не пересылайте его третьим лицам._",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="yummyunbind", description="Отвязать аккаунт YummyAnime от Discord-профиля")
+async def yummyunbind(interaction: discord.Interaction) -> None:
+    await unbind_yummy_account(interaction.user.id)
+    await interaction.response.send_message(
+        "Привязка YummyAnime снята. История импортов (`imported_yummy`) сохранена — повторный импорт не продублирует темы.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="syncyummy",
+    description="Подтянуть новые аниме из вашего списка YummyAnime в основной форум и личный топик",
+)
+@app_commands.describe(
+    yummy_list="Какой список на Yummy учитывать",
+    max_topics="Максимум новых тем за один раз (1–25)",
+)
+@app_commands.choices(
+    yummy_list=[
+        app_commands.Choice(name="Все списки", value="all"),
+        app_commands.Choice(name="Смотрю", value="watching"),
+        app_commands.Choice(name="В планах", value="plan_to_watch"),
+        app_commands.Choice(name="Просмотрено", value="completed"),
+        app_commands.Choice(name="Отложено", value="on_hold"),
+        app_commands.Choice(name="Брошено", value="dropped"),
+    ]
+)
+async def syncyummy(
+    interaction: discord.Interaction,
+    yummy_list: str,
+    max_topics: app_commands.Range[int, 1, 25] = 15,
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.response.send_message(
+            "Не задан **YUMMY_APPLICATION_TOKEN** на стороне бота.", ephemeral=True
+        )
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    r = await run_yummy_list_import_for_member(
+        interaction.guild,
+        interaction.user.id,
+        list_filter=yummy_list,
+        max_topics=int(max_topics),
+        session=bot.session,
+        app_token=app,
+    )
+    if r.get("error"):
+        await interaction.followup.send(
+            _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+        return
+    lines = [
+        f"**Новых тем:** **{r.get('n_new', 0)}**",
+        f"**Дописано в существующие:** **{r.get('merge_ops', 0)}**",
+    ]
+    cr = r.get("created_urls") or []
+    if cr:
+        lines.append("Новые: " + ", ".join(cr[:8]))
+        if len(cr) > 8:
+            lines.append(f"_…ещё {len(cr) - 8}_")
+    mer = r.get("merged_urls") or []
+    if mer:
+        lines.append("Объединено: " + ", ".join(mer[:6]))
+    er = r.get("errors") or []
+    if er:
+        lines.append("Замечания: " + "; ".join(er[:4]))
+    await interaction.followup.send(
+        _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
+    )
+
+
+admin_cmd_group = app_commands.Group(
+    name="admin",
+    description="Админ: YummyAnime, скан форума, личные списки, обновление тем",
+)
+
+
+@admin_cmd_group.command(
+    name="yummy_resync",
+    description="Принудительно синхронизировать список Yummy участника с форумом",
+)
+@app_commands.describe(
+    member="Участник с привязкой /yummybind",
+    max_topics="Максимум новых тем за запуск (1–25)",
+)
+async def admin_yummy_resync(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    max_topics: app_commands.Range[int, 1, 25] = 20,
+) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.response.send_message(
+            "Нет **YUMMY_APPLICATION_TOKEN**.", ephemeral=True
+        )
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    r = await run_yummy_list_import_for_member(
+        interaction.guild,
+        member.id,
+        list_filter="all",
+        max_topics=int(max_topics),
+        session=bot.session,
+        app_token=app,
+    )
+    if r.get("error"):
+        await interaction.followup.send(
+            _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+        return
+    msg = (
+        f"**{member.display_name}:** новых тем **{r.get('n_new', 0)}**, "
+        f"дописано **{r.get('merge_ops', 0)}**."
+    )
+    er = r.get("errors") or []
+    if er:
+        msg += "\n" + "; ".join(er[:3])
+    await interaction.followup.send(_truncate(msg, DISCORD_CONTENT_LIMIT), ephemeral=True)
+
+
+@admin_cmd_group.command(
+    name="yummy_status",
+    description="Статус последнего фонового опроса YummyAnime",
+)
+async def admin_yummy_status(interaction: discord.Interaction) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    state = await read_state_copy()
+    poll = (state.get("meta") or {}).get("yummy_poll")
+    if not isinstance(poll, dict):
+        embed = discord.Embed(
+            title="Фон YummyAnime",
+            description="Ещё не было успешного цикла (или опрос отключён — нет токена приложения).",
+            color=EMBED_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    desc = (
+        f"**Время (UTC):** {poll.get('last_run_utc', '—')}\n"
+        f"**Участников проверено:** {poll.get('users_checked', 0)}\n"
+        f"**Новых тем за цикл:** {poll.get('imports_new', 0)}\n"
+    )
+    errs = poll.get("errors")
+    if isinstance(errs, list) and errs:
+        desc += "**Ошибки:**\n" + "\n".join(f"· {_truncate(str(e), 200)}" for e in errs[:6])
+    embed = discord.Embed(title="Фон YummyAnime", description=desc, color=EMBED_COLOR)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@admin_cmd_group.command(
+    name="forum_scan",
+    description="Обновить anime_topics по веткам основного форума (как при старте синка списков)",
+)
+async def admin_forum_scan(interaction: discord.Interaction) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    assert interaction.guild is not None
+    scanned, updated = await sync_forum_threads_with_state(
+        bot, interaction.guild, bot.session
+    )
+    await interaction.followup.send(
+        f"Просмотрено веток: **{scanned}**, обновлено записей в состоянии: **{updated}**.",
+        ephemeral=True,
+    )
+
+
+@admin_cmd_group.command(
+    name="personal_rebuild",
+    description="Пересоздать карточки в личной теме участника",
+)
+@app_commands.describe(member="Участник")
+async def admin_personal_rebuild(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    assert interaction.guild is not None
+    try:
+        await ensure_personal_list_thread(
+            bot, interaction.guild, member, session=bot.session
+        )
+        await rebuild_personal_list_display(
+            bot, interaction.guild.id, member.id, session=bot.session
+        )
+    except Exception:
+        logger.exception("admin personal_rebuild")
+        await interaction.followup.send("Ошибка при пересборке.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"Личная тема **{member.display_name}** обновлена.", ephemeral=True
+    )
+
+
+@admin_cmd_group.command(
+    name="repair_topics",
+    description="Досинхронизировать темы основного форума (реакции, панели, карточка Yummy)",
+)
+async def admin_repair_topics(interaction: discord.Interaction) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    assert interaction.guild is not None
+    forum = await resolve_forum_channel(bot)
+    if not forum:
+        await interaction.followup.send("Канал форума не найден.", ephemeral=True)
+        return
+    seen: set[int] = set()
+    ok_n = 0
+    err_n = 0
+
+    async def run(th: discord.Thread) -> None:
+        nonlocal ok_n, err_n
+        if th.id in seen or th.parent_id != forum.id:
+            return
+        seen.add(th.id)
+        try:
+            await repair_single_forum_thread(bot, forum, th, bot.session)
+            ok_n += 1
+        except Exception:
+            logger.exception("admin repair_topics %s", th.id)
+            err_n += 1
+
+    for th in forum.threads:
+        await run(th)
+    gt = interaction.guild.threads
+    seq = gt.values() if hasattr(gt, "values") else gt
+    for th in seq:
+        if th.parent_id == forum.id:
+            await run(th)
+    try:
+        async for th in forum.archived_threads(limit=100):
+            await run(th)
+    except discord.HTTPException as e:
+        logger.warning("Архив форума admin: %s", e)
+    await interaction.followup.send(
+        f"Готово. Веток: **{len(seen)}**, успешно **{ok_n}**"
+        + (f", ошибок **{err_n}**" if err_n else "")
+        + ".",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(admin_cmd_group)
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+
+    @discord.ui.select(
+        placeholder="Выберите действие…",
+        custom_id="adminpanel:menu",
+        options=[
+            discord.SelectOption(
+                label="Статус фона Yummy",
+                value="yummy_status",
+                description="Последний автоматический опрос списков",
+            ),
+            discord.SelectOption(
+                label="Скан основного форума",
+                value="forum_scan",
+                description="Обновить anime_topics из веток",
+            ),
+            discord.SelectOption(
+                label="Обновить темы форума",
+                value="repair_topics",
+                description="Реакции, панели, описание Yummy",
+            ),
+        ],
+    )
+    async def admin_menu(
+        self, interaction: discord.Interaction, select: discord.ui.Select
+    ) -> None:
+        ok, err = _admin_member_ok(interaction)
+        if not ok:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        choice = select.values[0]
+        if choice == "yummy_status":
+            state = await read_state_copy()
+            poll = (state.get("meta") or {}).get("yummy_poll")
+            if not isinstance(poll, dict):
+                await interaction.response.send_message(
+                    "Фоновый опрос ещё не выполнялся или нет токена приложения.",
+                    ephemeral=True,
+                )
+                return
+            desc = (
+                f"**UTC:** {poll.get('last_run_utc', '—')}\n"
+                f"**Проверено пользователей:** {poll.get('users_checked', 0)}\n"
+                f"**Новых тем:** {poll.get('imports_new', 0)}\n"
+            )
+            errs = poll.get("errors")
+            if isinstance(errs, list) and errs:
+                desc += "\n".join(f"· {_truncate(str(x), 180)}" for x in errs[:5])
+            embed = discord.Embed(title="Yummy — фон", description=desc, color=EMBED_COLOR)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        assert interaction.guild is not None
+        if choice == "forum_scan":
+            if not bot.session:
+                await interaction.followup.send("Нет HTTP сессии.", ephemeral=True)
+                return
+            scanned, updated = await sync_forum_threads_with_state(
+                bot, interaction.guild, bot.session
+            )
+            await interaction.followup.send(
+                f"Скан: веток **{scanned}**, обновлено записей **{updated}**.",
+                ephemeral=True,
+            )
+            return
+        if choice == "repair_topics":
+            if not bot.session:
+                await interaction.followup.send("Нет HTTP сессии.", ephemeral=True)
+                return
+            forum = await resolve_forum_channel(bot)
+            if not forum:
+                await interaction.followup.send("Форум не найден.", ephemeral=True)
+                return
+            seen: set[int] = set()
+            ok_n = err_n = 0
+
+            async def run(th: discord.Thread) -> None:
+                nonlocal ok_n, err_n
+                if th.id in seen or th.parent_id != forum.id:
+                    return
+                seen.add(th.id)
+                try:
+                    await repair_single_forum_thread(bot, forum, th, bot.session)
+                    ok_n += 1
+                except Exception:
+                    logger.exception("adminpanel repair %s", th.id)
+                    err_n += 1
+
+            for th in forum.threads:
+                await run(th)
+            gt = interaction.guild.threads
+            seq = gt.values() if hasattr(gt, "values") else gt
+            for th in seq:
+                if th.parent_id == forum.id:
+                    await run(th)
+            try:
+                async for th in forum.archived_threads(limit=80):
+                    await run(th)
+            except discord.HTTPException as e:
+                logger.warning("adminpanel архив: %s", e)
+            await interaction.followup.send(
+                f"Тем обработано: **{len(seen)}**, ок **{ok_n}**"
+                + (f", ошибок **{err_n}**" if err_n else "")
+                + ".",
+                ephemeral=True,
+            )
+
+
+@bot.tree.command(
+    name="adminpanel",
+    description="[Админы] Панель быстрых действий бота",
+)
+async def adminpanel(interaction: discord.Interaction) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="Админ-панель",
+        description=(
+            "Меню слева — быстрые действия.\n"
+            "Полный набор: **`/admin yummy_resync`**, **`/admin forum_scan`**, "
+            "**`/admin repair_topics`**, **`/admin personal_rebuild`**, **`/admin yummy_status`**."
+        ),
+        color=EMBED_COLOR,
+    )
+    await interaction.response.send_message(
+        embed=embed, view=AdminPanelView(), ephemeral=True
+    )
 
 
 @bot.tree.command(
