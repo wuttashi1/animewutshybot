@@ -127,6 +127,8 @@ CONNECT_MAX_MERGES_PER_RUN = 50
 
 # Задержки (сек.): при 429 от Discord увеличьте через .env
 PERSONAL_REBUILD_DELAY_SEC = _env_float("PERSONAL_REBUILD_DELAY_SEC", 1.5, minimum=0.3)
+YUMMY_WEEKLY_SYNC_COOLDOWN_SEC = 7 * 24 * 3600
+WATCHED_TITLE_CACHE_SEC = 600.0
 DISCORD_LIST_CARD_DELAY_SEC = _env_float("DISCORD_LIST_CARD_DELAY_SEC", 0.12, minimum=0.03)
 DISCORD_LIST_DELETE_DELAY_SEC = _env_float("DISCORD_LIST_DELETE_DELAY_SEC", 0.02, minimum=0.0)
 FORUM_NEW_THREAD_DELAY_SEC = _env_float("FORUM_NEW_THREAD_DELAY_SEC", 0.55, minimum=0.15)
@@ -1724,8 +1726,8 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
             "панели **оценки** и **рекомендаций**.\n"
             "· **Форум личных списков** — у каждого участника своя тема. В теме: карточки аниме и **одна** "
             "панель внизу (**Обновить**, **Yummy «Просмотрено»**, **Экспорт .txt**, **Тема**).\n"
-            "· **Полный импорт Yummy** (все статусы списка) — `/yummy_sync`. С кнопки панели подтягивается "
-            "только раздел **«Просмотрено»** на YummyAnime.\n"
+            "· **Полный импорт Yummy** (все статусы) — `/yummy_sync`. Раз в **7 дней**: `/mylist_yummy_weekly` "
+            "(проверка дубликатов в личном списке + сверка со всеми списками Yummy). С панели — только **«Просмотрено»**.\n"
             "· На карточках личного списка в поле **«Также в списках»** видно, у кого ещё на сервере "
             "есть это аниме.\n"
             "· Если задан **`MONGODB_URI`**, привязки Yummy/MAL и всё состояние бота **сохраняются** "
@@ -1771,6 +1773,10 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
         ("`/mylist_top`", "До **5** аниме для блока «Топ» на карточках."),
         ("`/mylist_panel`", "Восстановить панель кнопок в личной теме."),
         (
+            "`/mylist_yummy_weekly`",
+            "Полная синхронизация со **всеми** списками YummyAnime (дубликаты в личном списке, дописывание в темы, новые темы) — **не чаще 1 раза в 7 дней**.",
+        ),
+        (
             "`/mylist_admin_sync`",
             "**Админы:** сначала обновляется состояние **основного форума**, затем пересобирается **личный** список участника и карточки.",
         ),
@@ -1789,7 +1795,10 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
             "Привязать аккаунт (модалка e-mail/пароль, опционально веб `/yummy-link`, или токен из браузера).",
         ),
         ("`/yummy_unbind`", "Отвязать аккаунт Yummy."),
-        ("`/yummy_sync`", "Импорт из API во **все** списки (создание/дополнение тем в основном форуме)."),
+        (
+            "`/yummy_sync`",
+            "Импорт из API (выбранный список или все) — новые темы в основном форуме; без лимита 7 дней.",
+        ),
         ("`/yummy_list` · `/yummy_status`", "Просмотр списка через API и статус привязки / фонового опроса."),
     ]
     for name, val in yummy_rows:
@@ -2629,7 +2638,9 @@ def _personal_hub_embed(pl: dict[str, Any], display_name: str) -> discord.Embed:
             "· **Тема** — цвет карточек, затем снова **Обновить**.\n\n"
             "Синхронизация с ветками основного форума: **`/mylist_admin_sync`** (админ). "
             f"Нумерация и компакт в данных: **нумерация {nums}**, **компакт {comp}**.\n"
-            "Полный импорт Yummy (все списки): **`/yummy_sync`**."
+            "Полный импорт без лимита: **`/yummy_sync`**. Раз в **7 дней**: **`/mylist_yummy_weekly`** "
+            "(все списки Yummy + проверка дубликатов в личном списке). "
+            "В названии темы — число **просмотренных** по Yummy (**✓N**), если аккаунт привязан."
         ),
         color=accent,
     )
@@ -2736,6 +2747,222 @@ async def _set_personal_list_fields(user_id: int, **fields: Any) -> None:
             pl[k] = v
         data["personal_lists"][uid] = pl
         _write_state(data)
+
+
+def _personal_list_duplicate_thread_groups(
+    state: dict[str, Any], user_id: int
+) -> list[list[str]]:
+    """Ключи личного списка, указывающие на одну и ту же ветку основного форума."""
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return []
+    order = pl.get("order")
+    if not isinstance(order, list):
+        return []
+    topics = state.get("anime_topics", {})
+    if not isinstance(topics, dict):
+        return []
+    tid_to_keys: dict[int, list[str]] = defaultdict(list)
+    for k in order:
+        ks = str(k).strip()
+        if not ks:
+            continue
+        ent = topics.get(ks)
+        if not isinstance(ent, dict):
+            continue
+        try:
+            tid = int(ent.get("thread_id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        if tid > 0:
+            tid_to_keys[tid].append(ks)
+    return [keys for keys in tid_to_keys.values() if len(keys) > 1]
+
+
+def _yummy_weekly_sync_cooldown_remaining_sec(user_id: int, state: dict[str, Any]) -> float:
+    """0 если можно вызывать; иначе секунд до снятия лимита."""
+    pl = (state.get("personal_lists") or {}).get(str(user_id))
+    if not isinstance(pl, dict):
+        return 0.0
+    try:
+        last = float(pl.get("yummy_weekly_sync_at") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if last <= 0:
+        return 0.0
+    elapsed = time.time() - last
+    if elapsed >= YUMMY_WEEKLY_SYNC_COOLDOWN_SEC:
+        return 0.0
+    return YUMMY_WEEKLY_SYNC_COOLDOWN_SEC - elapsed
+
+
+def _format_duration_ru(seconds: float) -> str:
+    if seconds <= 0:
+        return "сейчас"
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    parts: list[str] = []
+    if d:
+        parts.append(f"{d} д.")
+    if h:
+        parts.append(f"{h} ч.")
+    if m or not parts:
+        parts.append(f"{m} мин.")
+    return " ".join(parts)
+
+
+def _personal_thread_title_base(pl: dict[str, Any], display_name: str) -> str:
+    raw = (pl.get("thread_title_base") or "").strip()
+    if raw:
+        return raw[:80]
+    return f"{display_name} anime list"[:80]
+
+
+async def _count_yummy_watched_in_personal_order(
+    state: dict[str, Any],
+    user_id: int,
+    session: aiohttp.ClientSession,
+    app_token: str,
+) -> int | None:
+    """
+    Сколько позиций из личного списка совпадают с «Просмотрено» на YummyAnime.
+    None — нет привязки или ошибка API.
+    """
+    acc = (state.get("yummy_accounts") or {}).get(str(user_id))
+    if not isinstance(acc, dict):
+        return None
+    yuid = acc.get("yummy_user_id")
+    bearer = (acc.get("access_token") or "").strip()
+    if yuid is None or not bearer:
+        return None
+    try:
+        yuid_i = int(yuid)
+    except (TypeError, ValueError):
+        return None
+    items, new_tok, err = await yummy_api.yani_fetch_lists_with_token_refresh(
+        session, app_token, bearer, yuid_i, USER_AGENT
+    )
+    if err or items is None:
+        return None
+    if new_tok:
+        await update_yummy_access_token(user_id, new_tok)
+    watched = yummy_api.filter_yummy_entries_by_status(items, "completed")
+    watched_slugs: set[str] = set()
+    for e in watched:
+        slug = _clean_slug(yummy_api.yummy_entry_anime_url(e))
+        if slug:
+            watched_slugs.add(slug)
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return 0
+    order = pl.get("order")
+    if not isinstance(order, list):
+        return 0
+    return sum(1 for k in order if str(k).strip() in watched_slugs)
+
+
+async def update_personal_list_thread_title_with_watched(
+    client: discord.Client,
+    guild_id: int,
+    user_id: int,
+    session: aiohttp.ClientSession | None,
+    *,
+    force_refresh_count: bool = False,
+) -> None:
+    """Заголовок личной темы: база + «· ✓N» просмотренных по Yummy (если привязка есть)."""
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    state = await read_state_copy()
+    uid_s = str(user_id)
+    pl = (state.get("personal_lists") or {}).get(uid_s)
+    if not isinstance(pl, dict):
+        return
+    try:
+        tid = int(pl.get("thread_id") or 0)
+    except (TypeError, ValueError):
+        return
+    if not tid:
+        return
+
+    guild = client.get_guild(guild_id)
+    if guild is None:
+        try:
+            guild = await client.fetch_guild(guild_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+    display_name = member.display_name if member else str(user_id)
+    base = _personal_thread_title_base(pl, display_name)
+
+    thread = client.get_channel(tid)
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(tid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    if not isinstance(thread, discord.Thread):
+        return
+
+    acc = (state.get("yummy_accounts") or {}).get(uid_s)
+    has_yummy = isinstance(acc, dict) and (acc.get("access_token") or "").strip()
+    if not app or not session or not has_yummy:
+        name = base[:100]
+        if thread.name != name:
+            try:
+                await thread.edit(name=name)
+            except discord.HTTPException:
+                logger.exception("Личная тема: сброс заголовка без счётчика")
+        return
+
+    now = time.time()
+    cache = pl.get("watched_title_cache")
+    n: int | None = None
+    if (
+        not force_refresh_count
+        and isinstance(cache, dict)
+        and "n" in cache
+        and "ts" in cache
+    ):
+        try:
+            ts = float(cache["ts"])
+            if now - ts < WATCHED_TITLE_CACHE_SEC:
+                n = int(cache["n"])
+        except (TypeError, ValueError):
+            n = None
+    if n is None:
+        n = await _count_yummy_watched_in_personal_order(
+            state, user_id, session, app
+        )
+        if n is None:
+            name = base[:100]
+        else:
+            suffix = f" · ✓{n}"
+            room = max(0, 100 - len(suffix))
+            name = (base[:room] + suffix)[:100]
+            async with _state_lock:
+                data = _load_state()
+                pl2 = data.setdefault("personal_lists", {}).setdefault(uid_s, {})
+                pl2["watched_title_cache"] = {"ts": now, "n": n}
+                data["personal_lists"][uid_s] = pl2
+                _write_state(data)
+    else:
+        suffix = f" · ✓{n}"
+        room = max(0, 100 - len(suffix))
+        name = (base[:room] + suffix)[:100]
+
+    if thread.name != name:
+        try:
+            await thread.edit(name=name)
+        except discord.HTTPException:
+            logger.exception("Личная тема: обновление заголовка со счётчиком")
 
 
 def _is_personal_hub_message(m: discord.Message, bot_user_id: int) -> bool:
@@ -2959,6 +3186,13 @@ async def rebuild_personal_list_display(
         data["personal_lists"][uid_s] = pl3
         _write_state(data)
 
+    try:
+        await update_personal_list_thread_title_with_watched(
+            client, guild_id, user_id, session, force_refresh_count=False
+        )
+    except Exception:
+        logger.exception("rebuild_personal_list_display: заголовок темы")
+
 
 async def ensure_personal_list_thread(
     client: discord.Client,
@@ -3093,65 +3327,13 @@ async def ensure_personal_list_thread(
                 starter_message_id=starter.id,
                 clear_control_message=True,
             )
+            await _set_personal_list_fields(uid, thread_title_base=name[:80])
         else:
             logger.error(
                 "Личная тема %s: нет стартового сообщения, thread_id не записан в базу",
                 thread.id,
             )
         return thread
-
-
-async def append_user_anime_to_personal_state(
-    guild: discord.Guild,
-    user_id: int,
-    key: str,
-    title: str,
-) -> None:
-    """Добавляет ключ в порядок списка и кэш названий; затем обновляет сообщение в личной теме."""
-    key = str(key).strip()
-    if not key:
-        return
-    title = (title or "").strip() or _title_for_list_key(await read_state_copy(), key)
-    merged_same_forum_thread = False
-    async with _state_lock:
-        data = _load_state()
-        uid = str(user_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
-        order = pl.get("order")
-        if not isinstance(order, list):
-            order = []
-        topics = data.get("anime_topics", {})
-        ent_new = topics.get(key) if isinstance(topics, dict) else None
-        tid_new = int(ent_new.get("thread_id") or 0) if isinstance(ent_new, dict) else 0
-        if tid_new > 0:
-            for ex in order:
-                e2 = topics.get(ex) if isinstance(topics, dict) else None
-                t2 = int(e2.get("thread_id") or 0) if isinstance(e2, dict) else 0
-                if t2 == tid_new:
-                    pl["order"] = order
-                    data["personal_lists"][uid] = pl
-                    _write_state(data)
-                    merged_same_forum_thread = True
-                    break
-        if not merged_same_forum_thread:
-            if key not in order:
-                order.append(key)
-            pl["order"] = order
-            st = data.setdefault("slug_titles", {})
-            st[key] = title[:500]
-            data["slug_titles"] = st
-            data["personal_lists"][uid] = pl
-            _write_state(data)
-
-    member = guild.get_member(user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(user_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            logger.warning("Не удалось получить участника %s для личного списка.", user_id)
-            return
-    await ensure_personal_list_thread(bot, guild, member, session=bot.session)
-    schedule_personal_list_refresh(guild.id, user_id)
 
 
 def list_personal_anime_pairs(
@@ -3174,13 +3356,14 @@ async def sync_personal_list_from_anime_topics(
 ) -> tuple[int, str | None]:
     """
     Строит order из anime_topics (где пользователь в adders). Возвращает (число ключей, ошибка).
+    Сохраняет прежний порядок позиций; новые ключи дописываются в конец (по алфавиту названий).
     """
     async with _state_lock:
         data = _load_state()
         topics = data.get("anime_topics", {})
         if not isinstance(topics, dict):
             return 0, "Нет данных anime_topics."
-        keys: list[str] = []
+        keys_list: list[str] = []
         for key, ent in topics.items():
             if not isinstance(ent, dict):
                 continue
@@ -3188,10 +3371,26 @@ async def sync_personal_list_from_anime_topics(
                 continue
             ks = str(key).strip()
             if ks:
-                keys.append(ks)
-        keys.sort(key=lambda x: _title_for_list_key(data, x).lower())
+                keys_list.append(ks)
+        keys_set = set(keys_list)
         uid = str(target_id)
         pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        old_order = pl.get("order")
+        if not isinstance(old_order, list):
+            old_order = []
+        if not old_order:
+            keys = sorted(
+                keys_list,
+                key=lambda x: _title_for_list_key(data, x).lower(),
+            )
+        else:
+            old_filtered = [k for k in old_order if k in keys_set]
+            seen_old = set(old_filtered)
+            newcomers = [k for k in keys_list if k not in seen_old]
+            newcomers.sort(
+                key=lambda x: _title_for_list_key(data, x).lower(),
+            )
+            keys = old_filtered + newcomers
         old_top = pl.get("top5")
         if not isinstance(old_top, list):
             old_top = []
@@ -3217,6 +3416,32 @@ async def sync_personal_list_from_anime_topics(
     return len(keys), None
 
 
+async def reconcile_personal_list_from_main_forum(
+    guild: discord.Guild, user_id: int
+) -> None:
+    """
+    Личный список только из основного форума: пересобрать order из anime_topics.adders,
+    затем личная тема и отложенное обновление карточек.
+    """
+    _, err = await sync_personal_list_from_anime_topics(guild, user_id)
+    if err:
+        logger.warning("reconcile_personal_list_from_main_forum: %s", err)
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Не удалось получить участника %s для личного списка.", user_id
+            )
+            return
+    try:
+        await ensure_personal_list_thread(bot, guild, member, session=bot.session)
+    except Exception:
+        logger.exception("reconcile_personal_list_from_main_forum: ensure_personal_list_thread")
+    schedule_personal_list_refresh(guild.id, user_id)
+
+
 async def run_yummy_list_import_for_member(
     guild: discord.Guild,
     discord_user_id: int,
@@ -3225,6 +3450,9 @@ async def run_yummy_list_import_for_member(
     max_topics: int,
     session: aiohttp.ClientSession,
     app_token: str,
+    skip_imported_entries: bool = True,
+    reconcile_each_step: bool = True,
+    max_merge_ops: int = CONNECT_MAX_MERGES_PER_RUN,
 ) -> dict[str, Any]:
     """Новые позиции из API YummyAnime → основной форум и личный список."""
     empty: dict[str, Any] = {
@@ -3286,6 +3514,7 @@ async def run_yummy_list_import_for_member(
     errors: list[str] = []
     n_new = 0
     merge_ops = 0
+    merge_limit = max(1, int(max_merge_ops))
 
     for entry in entries:
         if n_new >= max_topics:
@@ -3293,7 +3522,7 @@ async def run_yummy_list_import_for_member(
         aid = yummy_api.yummy_entry_anime_id(entry)
         if aid is None:
             continue
-        if aid in imported_ids:
+        if skip_imported_entries and aid in imported_ids:
             continue
 
         err: str | None = None
@@ -3332,14 +3561,12 @@ async def run_yummy_list_import_for_member(
                         else f"<#{thread.id}>"
                     )
                     merged_urls.append(ju)
+                if reconcile_each_step:
                     try:
-                        tnm = thread.name[:200] if thread else query
-                        await append_user_anime_to_personal_state(
-                            guild, uid, slug_key, tnm
-                        )
+                        await reconcile_personal_list_from_main_forum(guild, uid)
                     except Exception:
                         logger.exception("Личный список после merge Yummy→Discord")
-                if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
+                if merge_ops >= merge_limit:
                     errors.append(
                         "Достигнут лимит дописываний за один запуск; запустите снова."
                     )
@@ -3350,13 +3577,12 @@ async def run_yummy_list_import_for_member(
                 await mark_yummy_imported(uid, aid)
                 imported_ids.add(aid)
                 merge_ops += 1
-                try:
-                    await append_user_anime_to_personal_state(
-                        guild, uid, slug_key, query[:500]
-                    )
-                except Exception:
-                    logger.exception("Личный список после already Yummy")
-                if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
+                if reconcile_each_step:
+                    try:
+                        await reconcile_personal_list_from_main_forum(guild, uid)
+                    except Exception:
+                        logger.exception("Личный список после already Yummy")
+                if merge_ops >= merge_limit:
                     errors.append(
                         "Достигнут лимит дописываний за один запуск; запустите снова."
                     )
@@ -3387,19 +3613,17 @@ async def run_yummy_list_import_for_member(
             errors.append(f"{query}: неизвестная ошибка")
             continue
 
-        try:
-            pk = _clean_slug((info.get("anime_url") or "").strip())
-            pt = str(info.get("title") or query)[:500]
-            await append_user_anime_to_personal_state(guild, uid, pk, pt)
-        except Exception:
-            logger.exception("Личный список после новой темы Yummy import")
+        if reconcile_each_step:
+            try:
+                await reconcile_personal_list_from_main_forum(guild, uid)
+            except Exception:
+                logger.exception("Личный список после новой темы Yummy import")
 
         await mark_yummy_imported(uid, aid)
         imported_ids.add(aid)
         n_new += 1
         ju = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
         created_urls.append(ju)
-        schedule_personal_list_refresh(guild.id, uid)
         await asyncio.sleep(FORUM_NEW_THREAD_DELAY_SEC)
 
     return {
@@ -3895,8 +4119,8 @@ class AddToMyListPanelView(discord.ui.View):
         )
         if st in ("merged", "already"):
             try:
-                await append_user_anime_to_personal_state(
-                    interaction.guild, interaction.user.id, key, ch.name[:500]
+                await reconcile_personal_list_from_main_forum(
+                    interaction.guild, interaction.user.id
                 )
             except Exception:
                 logger.exception("Кнопка add_to_my_list: личный список")
@@ -4525,6 +4749,7 @@ TEXT_ANIMEADD_RE = re.compile(
     r"^(?:!aa|!animeadd|!forum_add|/aa|/animeadd|/forum_add)\s+(.+)$",
     re.I | re.DOTALL,
 )
+THREAD_TITLE_WATCHED_SUFFIX_RE = re.compile(r"\s*·\s*✓\d+\s*$")
 
 
 async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) -> str:
@@ -4552,17 +4777,15 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
     thread, merge_st = await merge_adder_into_existing_topic(bot, slug_key, user_id)
     if merge_st == "merged":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
-        tname = thread.name[:200] if thread else (info.get("title") or slug_key)
         try:
-            await append_user_anime_to_personal_state(guild, user_id, slug_key, tname)
+            await reconcile_personal_list_from_main_forum(guild, user_id)
         except Exception:
             logger.exception("Личный список после merge animeadd")
         return f"Тема уже была — добавил вас в подпись: {link}"
     if merge_st == "already":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
         try:
-            tname = thread.name[:200] if thread else (info.get("title") or slug_key)
-            await append_user_anime_to_personal_state(guild, user_id, slug_key, tname)
+            await reconcile_personal_list_from_main_forum(guild, user_id)
         except Exception:
             logger.exception("Личный список после already animeadd")
         return f"Эта тема уже есть, вы уже среди добавивших: {link}"
@@ -4577,9 +4800,7 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
     if err or not thread:
         return err or "Не удалось создать тему."
     try:
-        await append_user_anime_to_personal_state(
-            guild, user_id, slug_key, str(info.get("title") or "")[:500]
-        )
+        await reconcile_personal_list_from_main_forum(guild, user_id)
     except Exception:
         logger.exception("Личный список после создания темы animeadd")
     link = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
@@ -4941,13 +5162,10 @@ async def _run_mal_import(
                         else f"<#{thread.id}>"
                     )
                     merged_urls.append(ju)
-                    try:
-                        tnm = thread.name[:200] if thread else query
-                        await append_user_anime_to_personal_state(
-                            interaction.guild, uid, slug_key, tnm
-                        )
-                    except Exception:
-                        logger.exception("Личный список после merge MAL→Yummy")
+                try:
+                    await reconcile_personal_list_from_main_forum(interaction.guild, uid)
+                except Exception:
+                    logger.exception("Личный список после merge MAL→Yummy")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
                     errors.append(
                         "Достигнут лимит дописываний в существующие темы за один запуск; "
@@ -4961,9 +5179,7 @@ async def _run_mal_import(
                 imported_ids.add(aid)
                 merge_ops += 1
                 try:
-                    await append_user_anime_to_personal_state(
-                        interaction.guild, uid, slug_key, query[:500]
-                    )
+                    await reconcile_personal_list_from_main_forum(interaction.guild, uid)
                 except Exception:
                     logger.exception("Личный список после already MAL→Yummy")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
@@ -4998,13 +5214,10 @@ async def _run_mal_import(
                         else f"<#{thread.id}>"
                     )
                     merged_urls.append(ju)
-                    try:
-                        tnm = thread.name[:200] if thread else query
-                        await append_user_anime_to_personal_state(
-                            interaction.guild, uid, f"mal:{aid}", tnm
-                        )
-                    except Exception:
-                        logger.exception("Личный список после merge MAL-only")
+                try:
+                    await reconcile_personal_list_from_main_forum(interaction.guild, uid)
+                except Exception:
+                    logger.exception("Личный список после merge MAL-only")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
                     errors.append(
                         "Достигнут лимит дописываний в существующие темы за один запуск; "
@@ -5018,9 +5231,7 @@ async def _run_mal_import(
                 imported_ids.add(aid)
                 merge_ops += 1
                 try:
-                    await append_user_anime_to_personal_state(
-                        interaction.guild, uid, f"mal:{aid}", query[:500]
-                    )
+                    await reconcile_personal_list_from_main_forum(interaction.guild, uid)
                 except Exception:
                     logger.exception("Личный список после already MAL-only")
                 if merge_ops >= CONNECT_MAX_MERGES_PER_RUN:
@@ -5046,13 +5257,7 @@ async def _run_mal_import(
             continue
 
         try:
-            if info:
-                pk = _clean_slug((info.get("anime_url") or "").strip())
-                pt = str(info.get("title") or query)[:500]
-            else:
-                pk = f"mal:{aid}"
-                pt = mal_item_title(entry)
-            await append_user_anime_to_personal_state(interaction.guild, uid, pk, pt)
+            await reconcile_personal_list_from_main_forum(interaction.guild, uid)
         except Exception:
             logger.exception("Личный список после новой темы из mal_import")
 
@@ -5568,6 +5773,133 @@ async def syncyummy(
     max_topics: app_commands.Range[int, 1, 25] = 15,
 ) -> None:
     await _run_yummy_sync(interaction, yummy_list, max_topics)
+
+
+async def _run_mylist_yummy_weekly(
+    interaction: discord.Interaction,
+    max_topics: int,
+) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    uid = interaction.user.id
+    state = await read_state_copy()
+    left = _yummy_weekly_sync_cooldown_remaining_sec(uid, state)
+    if left > 0:
+        await interaction.response.send_message(
+            f"Полная синхронизация Yummy доступна раз в **7 дней**. "
+            f"Повтор через **{_format_duration_ru(left)}**.",
+            ephemeral=True,
+        )
+        return
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.response.send_message(
+            "Не задан **YUMMY_APPLICATION_TOKEN** на стороне бота.", ephemeral=True
+        )
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    dup_groups = _personal_list_duplicate_thread_groups(state, uid)
+    try:
+        r = await run_yummy_list_import_for_member(
+            interaction.guild,
+            uid,
+            list_filter="all",
+            max_topics=int(max_topics),
+            session=bot.session,
+            app_token=app,
+            skip_imported_entries=False,
+            reconcile_each_step=False,
+            max_merge_ops=5000,
+        )
+    except Exception:
+        logger.exception("mylist_yummy_weekly import")
+        await interaction.followup.send(
+            "Ошибка при синхронизации (см. логи бота).", ephemeral=True
+        )
+        return
+    if r.get("error"):
+        await interaction.followup.send(
+            _truncate(str(r["error"]), DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+        return
+
+    try:
+        await reconcile_personal_list_from_main_forum(interaction.guild, uid)
+    except Exception:
+        logger.exception("mylist_yummy_weekly reconcile")
+    await _set_personal_list_fields(uid, yummy_weekly_sync_at=time.time())
+    try:
+        await update_personal_list_thread_title_with_watched(
+            bot,
+            interaction.guild.id,
+            uid,
+            bot.session,
+            force_refresh_count=True,
+        )
+    except Exception:
+        logger.exception("mylist_yummy_weekly title")
+
+    state_after = await read_state_copy()
+    lines = [
+        "**Полная синхронизация YummyAnime** (все списки) завершена.",
+        f"**Новых тем** на основном форуме: **{r.get('n_new', 0)}**.",
+        f"**Дописано** в уже существующие темы: **{r.get('merge_ops', 0)}**.",
+    ]
+    if dup_groups:
+        lines.append(
+            f"**Дубликаты в личном списке** (несколько ключей → одна ветка форума): **{len(dup_groups)}** групп."
+        )
+        for g in dup_groups[:5]:
+            preview = ", ".join(
+                _truncate(_title_for_list_key(state_after, x), 40) for x in g[:4]
+            )
+            if len(g) > 4:
+                preview += f" …+{len(g) - 4}"
+            lines.append(f"· {preview}")
+        if len(dup_groups) > 5:
+            lines.append(f"_…ещё групп: {len(dup_groups) - 5}_")
+    else:
+        lines.append("Дубликатов ключей на одну ветку в личном списке **не найдено**.")
+    cr = r.get("created_urls") or []
+    if cr:
+        lines.append("Новые темы: " + ", ".join(cr[:6]))
+        if len(cr) > 6:
+            lines.append(f"_…ещё {len(cr) - 6}_")
+    mer = r.get("merged_urls") or []
+    if mer:
+        lines.append("Объединено: " + ", ".join(mer[:5]))
+        if len(mer) > 5:
+            lines.append(f"_…ещё {len(mer) - 5}_")
+    er = r.get("errors") or []
+    if er:
+        lines.append("Замечания: " + "; ".join(er[:5]))
+    lines.append(
+        f"Следующий запуск **`/mylist_yummy_weekly`** — через **7 дней**."
+    )
+    await interaction.followup.send(
+        _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="mylist_yummy_weekly",
+    description="[Мой список] Полная сверка со всеми списками YummyAnime (не чаще 1 раза в 7 дней)",
+)
+@app_commands.describe(
+    max_topics="Максимум новых тем основного форума за этот запуск (1–60)",
+)
+async def mylist_yummy_weekly(
+    interaction: discord.Interaction,
+    max_topics: app_commands.Range[int, 1, 60] = 40,
+) -> None:
+    await _run_mylist_yummy_weekly(interaction, int(max_topics))
 
 
 @bot.tree.command(
@@ -6314,11 +6646,26 @@ async def _mylist_edit_impl(
         return
 
     if name:
+        base = THREAD_TITLE_WATCHED_SUFFIX_RE.sub("", name.strip())
+        await _set_personal_list_fields(uid, thread_title_base=base[:80])
+        sess = getattr(interaction.client, "session", None)
         try:
-            await thread.edit(name=name.strip()[:100])
-        except discord.HTTPException as e:
-            await interaction.followup.send(f"Не удалось сменить название: {e}", ephemeral=True)
-            return
+            await update_personal_list_thread_title_with_watched(
+                interaction.client,
+                interaction.guild.id,
+                uid,
+                sess,
+                force_refresh_count=True,
+            )
+        except Exception:
+            logger.exception("mylist_edit: заголовок со счётчиком")
+            try:
+                await thread.edit(name=name.strip()[:100])
+            except discord.HTTPException as e:
+                await interaction.followup.send(
+                    f"Не удалось сменить название: {e}", ephemeral=True
+                )
+                return
 
     if description:
         sid = int(pl.get("starter_message_id") or 0)
