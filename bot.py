@@ -1,8 +1,8 @@
 """
-Discord bot: YummyAnime основной форум (/animeadd), личные списки в LIST_FORUM_CHANNEL_ID,
-/animelist и /checkanime по сохранённым данным, /myanimelist (MAL), /yummybind + /syncyummy (API),
-фоновый опрос Yummy, /admin и /adminpanel, /update_topics.
-Справочная ветка: BOT_INFO_THREAD_ID. Токен: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
+Discord-бот: основной форум аниме (/forum_add), личные списки (форум из DISCORD_LIST_FORUM_CHANNEL_ID),
+/mylist_show, MAL (/mal_bind, /mal_import, /mal_show), YummyAnime (/yummy_link, /yummy_sync, …),
+фоновый опрос Yummy, /admin, /adminpanel, /update_topics.
+Справка: DISCORD_BOT_INFO_THREAD_ID. Токен бота: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import time
 import re
 import sys
 from pathlib import Path
@@ -23,15 +24,33 @@ from urllib.parse import quote
 import aiohttp
 import discord
 import yummy_api
+from aiohttp import web
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
 
-FORUM_CHANNEL_ID = 1393418241468141580
-# Форум «личные списки»: по одной теме на пользователя (зеркало добавлений из основного форума).
-LIST_FORUM_CHANNEL_ID = 1491208484245602385
-# Ветка форума со справкой и списком команд (редактируйте сообщения там вручную при необходимости).
-BOT_INFO_THREAD_ID = 1490073562122289276
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+def _env_channel_id(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Некорректный %s=%r — используется значение по умолчанию.", name, raw)
+        return default
+
+
+# ID каналов-форумов настраиваются в .env (см. .env.example).
+FORUM_CHANNEL_ID = _env_channel_id("DISCORD_ANIME_FORUM_CHANNEL_ID", 1393418241468141580)
+# Форум «личные списки»: по одной теме на пользователя.
+LIST_FORUM_CHANNEL_ID = _env_channel_id("DISCORD_LIST_FORUM_CHANNEL_ID", 1491208484245602385)
+# Ветка со справкой по командам.
+BOT_INFO_THREAD_ID = _env_channel_id("DISCORD_BOT_INFO_THREAD_ID", 1490073562122289276)
 BASE = "https://en.yummyani.me"
 API_SEARCH = f"{BASE}/api/search"
 API_ANIME = f"{BASE}/api/anime"
@@ -55,10 +74,7 @@ MAL_ANIME_PAGE_RE = re.compile(
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 STATE_PATH = DATA_DIR / "mal_state.json"
-
-load_dotenv()
-
-logger = logging.getLogger(__name__)
+YUMMY_LINK_STATE_PATH = DATA_DIR / "yummy_link_state.json"
 
 MAL_STATUS_ALL = 7
 MAL_STATUS_NAMES: dict[int, str] = {
@@ -471,6 +487,165 @@ def build_message_content(
 
 
 _state_lock = asyncio.Lock()
+_personal_list_thread_locks: dict[int, asyncio.Lock] = {}
+_yummy_link_state_lock = asyncio.Lock()
+YUMMY_LINK_PENDING_TTL_SEC = 900
+YUMMY_LINK_READY_TTL_SEC = 600
+
+
+def _personal_list_thread_lock(user_id: int) -> asyncio.Lock:
+    lock = _personal_list_thread_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _personal_list_thread_locks[user_id] = lock
+    return lock
+
+
+def _default_yummy_link_state() -> dict[str, Any]:
+    return {"pending": {}, "ready": {}}
+
+
+def _load_yummy_link_state_raw() -> dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not YUMMY_LINK_STATE_PATH.is_file():
+        return _default_yummy_link_state()
+    try:
+        raw = YUMMY_LINK_STATE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return _default_yummy_link_state()
+    if not isinstance(data, dict):
+        return _default_yummy_link_state()
+    data.setdefault("pending", {})
+    data.setdefault("ready", {})
+    if not isinstance(data["pending"], dict):
+        data["pending"] = {}
+    if not isinstance(data["ready"], dict):
+        data["ready"] = {}
+    return data
+
+
+def _save_yummy_link_state_raw(data: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    YUMMY_LINK_STATE_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _yummy_link_prune_pending_unlocked(pending: dict[str, Any], now: float) -> None:
+    for k, v in list(pending.items()):
+        if not isinstance(v, dict):
+            pending.pop(k, None)
+            continue
+        try:
+            exp = float(v.get("exp", 0))
+        except (TypeError, ValueError):
+            exp = 0
+        if exp < now:
+            pending.pop(k, None)
+
+
+async def yummy_link_create_session(discord_user_id: int) -> str:
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        pending = st["pending"]
+        assert isinstance(pending, dict)
+        _yummy_link_prune_pending_unlocked(pending, now)
+        pending[token] = {"user_id": int(discord_user_id), "exp": now + YUMMY_LINK_PENDING_TTL_SEC}
+        _save_yummy_link_state_raw(st)
+    return token
+
+
+async def yummy_link_consume_ready(discord_user_id: int) -> dict[str, Any] | None:
+    uid_s = str(int(discord_user_id))
+    now = time.time()
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        ready = st["ready"]
+        assert isinstance(ready, dict)
+        for k, v in list(ready.items()):
+            if not isinstance(v, dict):
+                ready.pop(k, None)
+                continue
+            try:
+                exp = float(v.get("exp", 0))
+            except (TypeError, ValueError):
+                exp = 0
+            if exp < now:
+                ready.pop(k, None)
+        ent = ready.pop(uid_s, None)
+        if isinstance(ent, dict):
+            _save_yummy_link_state_raw(st)
+            return ent
+        _save_yummy_link_state_raw(st)
+    return None
+
+
+async def yummy_link_store_ready(
+    discord_user_id: int, *, access_token: str, yummy_user_id: int, nickname: str
+) -> None:
+    uid_s = str(int(discord_user_id))
+    now = time.time()
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        ready = st["ready"]
+        assert isinstance(ready, dict)
+        ready[uid_s] = {
+            "access_token": access_token.strip(),
+            "yummy_user_id": int(yummy_user_id),
+            "nickname": (nickname or "").strip(),
+            "exp": now + YUMMY_LINK_READY_TTL_SEC,
+        }
+        _save_yummy_link_state_raw(st)
+
+
+async def yummy_link_pending_user_id(token: str) -> int | None:
+    """Возвращает discord user_id для действующей сессии привязки (без удаления)."""
+    tok = (token or "").strip()
+    if not tok:
+        return None
+    now = time.time()
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        pending = st["pending"]
+        assert isinstance(pending, dict)
+        _yummy_link_prune_pending_unlocked(pending, now)
+        ent = pending.get(tok)
+        if not isinstance(ent, dict):
+            _save_yummy_link_state_raw(st)
+            return None
+        try:
+            exp = float(ent.get("exp", 0))
+        except (TypeError, ValueError):
+            exp = 0
+        if exp < now:
+            pending.pop(tok, None)
+            _save_yummy_link_state_raw(st)
+            return None
+        try:
+            uid = int(ent.get("user_id"))
+        except (TypeError, ValueError):
+            pending.pop(tok, None)
+            _save_yummy_link_state_raw(st)
+            return None
+        _save_yummy_link_state_raw(st)
+        return uid
+
+
+async def yummy_link_remove_pending(token: str) -> None:
+    tok = (token or "").strip()
+    if not tok:
+        return
+    async with _yummy_link_state_lock:
+        st = _load_yummy_link_state_raw()
+        pending = st["pending"]
+        assert isinstance(pending, dict)
+        pending.pop(tok, None)
+        _save_yummy_link_state_raw(st)
 
 
 def _default_state() -> dict[str, Any]:
@@ -1289,21 +1464,19 @@ def _build_bot_commands_embed() -> discord.Embed:
         color=EMBED_COLOR,
     )
     rows = [
-        ("`/addanime` (`/animeadd`, `/aa`)", "Добавить аниме в **основной** форум и сразу в личный список."),
-        ("`/mylist` (`/animelist`, `/checkanime`)", "Личный Discord-список (без обхода всего форума)."),
-        ("`/editmyanimelist` / **`/settopanime`**", "Название и первый пост; топ-5 на карточках."),
-        ("`/mytopicpanel`", "Снова вывести панель кнопок в личной теме (после сбоев)."),
-        ("`/malbind`", "Привязать/перепривязать ссылку MAL (делается один раз, потом по необходимости)."),
-        ("`/connectmyanimelist`", "Импортировать из привязанного MAL в основной форум."),
-        ("`/yummybind` / `/yummyunbind`", "Привязать Bearer-токен YummyAnime (из DevTools после входа на сайт) / отвязать."),
-        ("`/syncyummy`", "Импорт **новых** позиций из вашего списка YummyAnime в основной форум и личный топик."),
-        ("`/myanimelist` и `/checkanimelist`", "Показать MAL-список с сайта (ваш или выбранного участника)."),
-        ("`/syncmylist` (`/syncanimelist`)", "**Админы:** пересобрать личный список участника из тем основного форума."),
-        ("`/admin` …", "**Админы:** подкоманды `yummy_resync`, `yummy_status`, `forum_scan`, `personal_rebuild`, `repair_topics`."),
-        ("`/adminpanel`", "**Админы:** меню быстрых действий (статус Yummy, скан форума, обновление тем)."),
-        ("`/rateanime`", "Оценка 1–10 в теме **основного** форума с аниме (или кнопка «Оценить»)."),
-        ("`/checkduplicates`", "Дубликаты тем основного форума и удаление лишних."),
-        ("`/update_topics`", "**Админы:** догнать старые темы основного форума — реакции, панели, карточку."),
+        ("**Форум** `/forum_add` (`/aa`, `/animeadd`)", "Добавить аниме в **основной** форум и личный список."),
+        ("**Мой список** `/mylist_show`", "Личный Discord-список (без обхода всего форума)."),
+        ("`/mylist_edit` / `/mylist_top`", "Название темы и первый пост; топ-5 на карточках."),
+        ("`/mylist_panel`", "Панель кнопок в личной теме (после сбоев)."),
+        ("**MAL** `/mal_bind` · `/mal_import` · `/mal_show`", "Привязка, импорт в форум, просмотр списка с сайта."),
+        ("**Yummy** `/yummy_link` · `/yummy_token` · `/yummy_unbind`", "Привязка (веб или токен вручную), отвязка."),
+        ("`/yummy_sync` · `/yummy_list` · `/yummy_status`", "Импорт в Discord, просмотр списка API, статус привязки."),
+        ("**Админ** `/mylist_admin_sync`", "Пересобрать личный список участника из тем основного форума."),
+        ("`/admin` …", "`yummy_resync`, `yummy_status`, `forum_scan`, `personal_rebuild`, `repair_topics`."),
+        ("`/adminpanel`", "Меню быстрых действий."),
+        ("`/rateanime`", "Оценка 1–10 в теме основного форума."),
+        ("`/checkduplicates`", "Дубликаты тем и удаление лишних."),
+        ("`/update_topics`", "**Админы:** реакции, панели, карточка в старых темах."),
     ]
     for name, desc in rows:
         e.add_field(name=name, value=desc, inline=False)
@@ -1770,12 +1943,12 @@ class PersonalTopicHubView(discord.ui.View):
             "**Личный топик**\n"
             "· Карточки подтягиваются из основного форума; средняя оценка — с YummyAnime или MAL.\n"
             "· **Ваша оценка** — из панели «Оценить» в **теме этого аниме** на основном форуме.\n"
-            "· `/settopanime` — закрепить топ-5 (звезда на карточке).\n"
-            "· `/editmyanimelist` — название темы и первый пост.\n"
+            "· `/mylist_top` — закрепить топ-5 (звезда на карточке).\n"
+            "· `/mylist_edit` — название темы и первый пост.\n"
             "· **Синхронизировать** — как `/syncanimelist` для вас: парсинг основного форума + список в теме.\n"
-            "· **Yummy ↻** — подтянуть новые тайтлы из вашего списка на YummyAnime (нужны `/yummybind` и токен приложения у бота).\n"
+            "· **Yummy ↻** — подтянуть новые тайтлы с YummyAnime (нужны `/yummy_link` или `/yummy_token` и токен приложения у бота).\n"
             "· **Экспорт** — Markdown-список с ссылками (только вам).\n"
-            "· `/mytopicpanel` — восстановить панель после сбоев.\n"
+            "· `/mylist_panel` — восстановить панель после сбоев.\n"
             "· Jikan — публичный API; при лимитах постер MAL может не подгрузиться.\n"
         )
         await interaction.response.send_message(text, ephemeral=True)
@@ -2296,74 +2469,107 @@ async def ensure_personal_list_thread(
     *,
     session: aiohttp.ClientSession | None,
 ) -> discord.Thread | None:
-    """Создаёт тему в LIST_FORUM при первом добавлении, если её ещё нет."""
+    """Одна тема LIST_FORUM на пользователя; защита от гонок и «битого» thread_id в базе."""
     uid = member.id
-    async with _state_lock:
-        data = _load_state()
-        pl_raw = (data.get("personal_lists") or {}).get(str(uid))
-        existing_id = pl_raw.get("thread_id") if isinstance(pl_raw, dict) else None
+    async with _personal_list_thread_lock(uid):
+        async with _state_lock:
+            data = _load_state()
+            pl_raw = (data.get("personal_lists") or {}).get(str(uid))
+            existing_id = pl_raw.get("thread_id") if isinstance(pl_raw, dict) else None
 
-    if existing_id:
-        try:
-            eid = int(existing_id)
-        except (TypeError, ValueError):
-            eid = 0
-        if eid:
-            ch = client.get_channel(eid)
-            if ch is None:
-                try:
-                    ch = await client.fetch_channel(eid)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    ch = None
-            if isinstance(ch, discord.Thread) and ch.parent_id == LIST_FORUM_CHANNEL_ID:
-                await apply_personal_list_permissions(ch, guild, uid)
-                return ch
+        if existing_id:
+            try:
+                eid = int(existing_id)
+            except (TypeError, ValueError):
+                eid = 0
+            if eid:
+                ch = client.get_channel(eid)
+                if ch is None:
+                    try:
+                        ch = await client.fetch_channel(eid)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        ch = None
+                if isinstance(ch, discord.Thread) and ch.parent_id == LIST_FORUM_CHANNEL_ID:
+                    await apply_personal_list_permissions(ch, guild, uid)
+                    return ch
+                async with _state_lock:
+                    data = _load_state()
+                    pl = data.setdefault("personal_lists", {}).setdefault(str(uid), {})
+                    for k in (
+                        "thread_id",
+                        "starter_message_id",
+                        "control_message_id",
+                        "list_message_id",
+                    ):
+                        pl.pop(k, None)
+                    data["personal_lists"][str(uid)] = pl
+                    _write_state(data)
 
-    forum = await resolve_list_forum_channel(client)
-    if not forum:
-        logger.warning("Канал личных списков %s не найден.", LIST_FORUM_CHANNEL_ID)
-        return None
+        async with _state_lock:
+            data = _load_state()
+            pl_raw2 = (data.get("personal_lists") or {}).get(str(uid))
+            again = pl_raw2.get("thread_id") if isinstance(pl_raw2, dict) else None
+        if again:
+            try:
+                eid2 = int(again)
+            except (TypeError, ValueError):
+                eid2 = 0
+            if eid2:
+                ch2 = client.get_channel(eid2)
+                if ch2 is None:
+                    try:
+                        ch2 = await client.fetch_channel(eid2)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        ch2 = None
+                if isinstance(ch2, discord.Thread) and ch2.parent_id == LIST_FORUM_CHANNEL_ID:
+                    await apply_personal_list_permissions(ch2, guild, uid)
+                    return ch2
 
-    name = f"{member.display_name} anime list"[:100]
-    intro = (
-        f"{member.mention} — **личный список аниме**.\n\n"
-        "Название темы и этот текст: `/editmyanimelist` · топ-5: `/settopanime`\n"
-        "Панель **кнопок** под этим сообщением — тема, нумерация, обновление карточек.\n\n"
-        "_Ниже — по одному сообщению на каждое аниме (обложка, оценки)._"
-    )
-    try:
-        twm = await forum.create_thread(name=name, content=intro)
-        thread = twm.thread
-        starter = twm.message
-    except discord.Forbidden:
-        logger.warning("Нет прав создавать темы в форуме личных списков.")
-        return None
-    except discord.HTTPException as e:
-        logger.warning("Создание личной темы: %s", e)
-        return None
+        forum = await resolve_list_forum_channel(client)
+        if not forum:
+            logger.warning("Канал личных списков %s не найден.", LIST_FORUM_CHANNEL_ID)
+            return None
 
-    stub_pl = {
-        "accent_color": EMBED_COLOR,
-        "show_numbers": False,
-        "compact_cards": False,
-    }
-    hub_embed = _personal_hub_embed(stub_pl, member.display_name)
-    hub_view = PersonalTopicHubView()
-    try:
-        hub_msg = await thread.send(embed=hub_embed, view=hub_view)
-    except discord.HTTPException:
-        hub_msg = None
-
-    await apply_personal_list_permissions(thread, guild, uid)
-
-    if starter and hub_msg:
-        await _save_personal_thread_meta(
-            uid,
-            thread_id=thread.id,
-            starter_message_id=starter.id,
-            control_message_id=hub_msg.id,
+        name = f"{member.display_name} anime list"[:100]
+        intro = (
+            f"{member.mention} — **личный список аниме**.\n\n"
+            "Название темы и текст: `/mylist_edit` · топ-5: `/mylist_top`\n"
+            "Панель **кнопок** под этим сообщением — тема, нумерация, обновление карточек.\n\n"
+            "_Ниже — по одному сообщению на каждое аниме (обложка, оценки)._"
         )
-    return thread
+        try:
+            twm = await forum.create_thread(name=name, content=intro)
+            thread = twm.thread
+            starter = twm.message
+        except discord.Forbidden:
+            logger.warning("Нет прав создавать темы в форуме личных списков.")
+            return None
+        except discord.HTTPException as e:
+            logger.warning("Создание личной темы: %s", e)
+            return None
+
+        stub_pl = {
+            "accent_color": EMBED_COLOR,
+            "show_numbers": False,
+            "compact_cards": False,
+        }
+        hub_embed = _personal_hub_embed(stub_pl, member.display_name)
+        hub_view = PersonalTopicHubView()
+        try:
+            hub_msg = await thread.send(embed=hub_embed, view=hub_view)
+        except discord.HTTPException:
+            hub_msg = None
+
+        await apply_personal_list_permissions(thread, guild, uid)
+
+        if starter and hub_msg:
+            await _save_personal_thread_meta(
+                uid,
+                thread_id=thread.id,
+                starter_message_id=starter.id,
+                control_message_id=hub_msg.id,
+            )
+        return thread
 
 
 async def append_user_anime_to_personal_state(
@@ -2489,7 +2695,7 @@ async def run_yummy_list_import_for_member(
     state = await read_state_copy()
     acc = (state.get("yummy_accounts") or {}).get(str(discord_user_id))
     if not isinstance(acc, dict):
-        empty["error"] = "Аккаунт YummyAnime не привязан (`/yummybind`)."
+        empty["error"] = "Аккаунт YummyAnime не привязан (`/yummy_link` или `/yummy_token`)."
         return empty
     yuid = acc.get("yummy_user_id")
     bearer = (acc.get("access_token") or "").strip()
@@ -3279,6 +3485,204 @@ class DuplicateCleanupView(discord.ui.View):
         await interaction.followup.send("\n".join(parts), ephemeral=True)
 
 
+def _yummy_link_hcaptcha_site_key() -> str:
+    return (
+        os.environ.get("YUMMY_HCAPTCHA_SITE_KEY") or "b1847961-208e-4a90-9671-1e6bba9e0b36"
+    ).strip()
+
+
+def _html_esc(s: str) -> str:
+    import html
+
+    return html.escape(s, quote=True)
+
+
+def _page_yummy_link_form(*, token: str, error: str | None = None) -> str:
+    sk = _yummy_link_hcaptcha_site_key()
+    err_block = ""
+    if error:
+        err_block = f'<p class="err">{_html_esc(error)}</p>'
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>YummyAnime — привязка</title>
+<style>
+body {{ font-family: system-ui,sans-serif; max-width: 28rem; margin: 2rem auto; padding: 0 1rem; }}
+.err {{ color: #c0392b; }}
+label {{ display:block; margin-top:1rem; }}
+button {{ margin-top:1.25rem; padding: .5rem 1rem; }}
+</style>
+</head>
+<body>
+<h1>Вход YummyAnime</h1>
+<p>Данные отправляются на официальный API YummyAnime. После успеха вернитесь в Discord и нажмите кнопку завершения.</p>
+{err_block}
+<form method="post" action="/yummy-link">
+<input type="hidden" name="token" value="{_html_esc(token)}"/>
+<label>E-mail <input type="email" name="email" required autocomplete="username"/></label>
+<label>Пароль <input type="password" name="password" required autocomplete="current-password"/></label>
+<div class="h-captcha" data-sitekey="{_html_esc(sk)}"></div>
+<script src="https://js.hcaptcha.com/1/api.js" async defer></script>
+<button type="submit">Войти и привязать</button>
+</form>
+</body>
+</html>"""
+
+
+def _page_yummy_link_ok() -> str:
+    return """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"/><title>Готово</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem">
+<h1>Вход выполнен</h1>
+<p>Вернитесь в Discord и нажмите кнопку <strong>«Завершить привязку YummyAnime»</strong>.</p>
+</body></html>"""
+
+
+def _page_yummy_link_bad() -> str:
+    return """<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"/><title>Ссылка недействительна</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem">
+<p>Сессия истекла или ссылка неверная. Запросите новую командой <code>/yummy_link</code> в Discord.</p>
+</body></html>"""
+
+
+async def _yummy_link_web_get(request: web.Request) -> web.StreamResponse:
+    token = (request.query.get("token") or "").strip()
+    if not token:
+        return web.Response(
+            text=_page_yummy_link_bad(),
+            content_type="text/html; charset=utf-8",
+            status=400,
+        )
+    uid = await yummy_link_pending_user_id(token)
+    if uid is None:
+        return web.Response(
+            text=_page_yummy_link_bad(),
+            content_type="text/html; charset=utf-8",
+            status=400,
+        )
+    return web.Response(
+        text=_page_yummy_link_form(token=token),
+        content_type="text/html; charset=utf-8",
+    )
+
+
+async def _yummy_link_web_post(request: web.Request) -> web.StreamResponse:
+    bot = request.app["bot"]
+    app_tok = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app_tok or not bot.session:
+        return web.Response(
+            text="<html><body><p>Сервер бота не настроен (YUMMY_APPLICATION_TOKEN).</p></body></html>",
+            content_type="text/html; charset=utf-8",
+            status=503,
+        )
+    data = await request.post()
+    token = str(data.get("token") or "").strip()
+    email = str(data.get("email") or "").strip()
+    password = str(data.get("password") or "")
+    captcha = str(data.get("h-captcha-response") or "").strip()
+    uid = await yummy_link_pending_user_id(token)
+    if uid is None:
+        return web.Response(
+            text=_page_yummy_link_bad(),
+            content_type="text/html; charset=utf-8",
+            status=400,
+        )
+    access, err_msg, _st = await yummy_api.yani_login(
+        bot.session, app_tok, email, password, captcha or None, USER_AGENT
+    )
+    if not access:
+        detail = err_msg or "Не удалось войти."
+        return web.Response(
+            text=_page_yummy_link_form(token=token, error=detail),
+            content_type="text/html; charset=utf-8",
+            status=200,
+        )
+    prof = await yummy_api.yani_get_profile(bot.session, app_tok, access, USER_AGENT)
+    if not prof:
+        return web.Response(
+            text=_page_yummy_link_form(
+                token=token, error="Токен получен, но профиль не загрузился."
+            ),
+            content_type="text/html; charset=utf-8",
+        )
+    yid = prof.get("id")
+    if yid is None:
+        return web.Response(
+            text=_page_yummy_link_form(token=token, error="Ответ профиля без id."),
+            content_type="text/html; charset=utf-8",
+        )
+    try:
+        yid_i = int(yid)
+    except (TypeError, ValueError):
+        return web.Response(
+            text=_page_yummy_link_form(token=token, error="Некорректный id в профиле."),
+            content_type="text/html; charset=utf-8",
+        )
+    nick = str(prof.get("nickname") or "")
+    await yummy_link_remove_pending(token)
+    await yummy_link_store_ready(
+        uid, access_token=access, yummy_user_id=yid_i, nickname=nick
+    )
+    return web.Response(
+        text=_page_yummy_link_ok(), content_type="text/html; charset=utf-8"
+    )
+
+
+def create_yummy_link_web_app(bot: commands.Bot) -> web.Application:
+    app = web.Application(client_max_size=1024**2)
+    app["bot"] = bot
+    app.router.add_get("/yummy-link", _yummy_link_web_get)
+    app.router.add_post("/yummy-link", _yummy_link_web_post)
+    return app
+
+
+class YummyLinkVerifyView(discord.ui.View):
+    """Постоянная кнопка: забирает токен из data/yummy_link_state после веб-входа."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Завершить привязку YummyAnime",
+        style=discord.ButtonStyle.primary,
+        custom_id="yummy_link:verify",
+    )
+    async def verify(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        ent = await yummy_link_consume_ready(interaction.user.id)
+        if not ent:
+            await interaction.response.send_message(
+                "Нет готовой привязки. Сначала откройте ссылку из `/yummy_link` и войдите на сайте, "
+                "либо срок ожидания истёк — запросите ссылку снова.",
+                ephemeral=True,
+            )
+            return
+        tok = (ent.get("access_token") or "").strip()
+        if not tok:
+            await interaction.response.send_message(
+                "Ошибка данных привязки. Повторите `/yummy_link`.", ephemeral=True
+            )
+            return
+        try:
+            yuid = int(ent.get("yummy_user_id"))
+        except (TypeError, ValueError):
+            await interaction.response.send_message(
+                "Ошибка данных привязки. Повторите `/yummy_link`.", ephemeral=True
+            )
+            return
+        nick = str(ent.get("nickname") or "")
+        await bind_yummy_account(interaction.user.id, tok, yuid, nick)
+        await interaction.response.send_message(
+            f"YummyAnime привязан (**{nick or yuid}**). Импорт: `/yummy_sync` или кнопка **Yummy ↻** в личной теме.\n"
+            "_Токен хранится на сервере с ботом._",
+            ephemeral=True,
+        )
+
+
 class YummyBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -3293,6 +3697,24 @@ class YummyBot(commands.Bot):
         self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
         self.add_view(PersonalTopicHubView())
         self.add_view(AddToMyListPanelView())
+        self.add_view(YummyLinkVerifyView())
+        port_raw = (os.environ.get("YUMMY_LINK_HTTP_PORT") or "").strip()
+        self._yummy_link_runner: web.AppRunner | None = None
+        if port_raw:
+            try:
+                port = int(port_raw)
+                host = (os.environ.get("YUMMY_LINK_HTTP_HOST") or "127.0.0.1").strip()
+                if not host:
+                    host = "127.0.0.1"
+                web_app = create_yummy_link_web_app(self)
+                runner = web.AppRunner(web_app)
+                await runner.setup()
+                site = web.TCPSite(runner, host=host, port=port)
+                await site.start()
+                self._yummy_link_runner = runner
+                logger.info("Веб-вход YummyAnime: http://%s:%s/yummy-link", host, port)
+            except Exception:
+                logger.exception("Не удалось запустить YUMMY_LINK_HTTP_PORT")
         guild_id = (os.environ.get("DISCORD_GUILD_ID") or "").strip()
 
         async def _sync_global() -> None:
@@ -3344,6 +3766,10 @@ class YummyBot(commands.Bot):
             )
 
     async def close(self) -> None:
+        runner = getattr(self, "_yummy_link_runner", None)
+        if runner is not None:
+            await runner.cleanup()
+            self._yummy_link_runner = None
         if self.session:
             await self.session.close()
         await super().close()
@@ -3352,7 +3778,7 @@ class YummyBot(commands.Bot):
 bot = YummyBot()
 
 TEXT_ANIMEADD_RE = re.compile(
-    r"^(?:!aa|!animeadd|/aa|/animeadd)\s+(.+)$",
+    r"^(?:!aa|!animeadd|!forum_add|/aa|/animeadd|/forum_add)\s+(.+)$",
     re.I | re.DOTALL,
 )
 
@@ -3421,7 +3847,7 @@ async def build_mal_list_embed_for_member(
     """Список MAL с сайта. (embed, err_text)."""
     acc = state.get("mal_accounts", {}).get(str(member.id))
     if not isinstance(acc, dict):
-        return None, f"{member.mention} ещё не привязал список MAL (`/connectmyanimelist`)."
+        return None, f"{member.mention} ещё не привязал список MAL (`/mal_bind`, затем `/mal_import`)."
     username = (acc.get("username") or "").strip()
     list_url = (acc.get("list_url") or "").strip()
     if not username:
@@ -3485,7 +3911,7 @@ async def run_animelist_discord_topics(
             None,
             f"{target.mention} — в личном списке пока нет записей. "
             "Они появляются при добавлении аниме в основной форум (`/addanime`). "
-            "Если вы уже добавляли раньше, админ может выполнить `/syncmylist` для вашего профиля.",
+            "Если вы уже добавляли раньше, админ может выполнить `/mylist_admin_sync` для вашего профиля.",
             0,
             0,
         )
@@ -3498,7 +3924,7 @@ async def run_animelist_discord_topics(
         description=_truncate(body, EMBED_DESC_LIMIT),
         color=EMBED_COLOR,
     )
-    embed.set_footer(text="Данные из личной темы списков · команда /checkanime")
+    embed.set_footer(text="Данные из личной темы списков · /mylist_show")
     return embed, None, len(pairs), 0
 
 
@@ -3543,47 +3969,46 @@ async def on_message(message: discord.Message) -> None:
             out = await run_animeadd_for_user(message.guild, message.author.id, query)
         except Exception:
             logger.exception("Текстовый animeadd")
-            out = "Произошла ошибка при добавлении. Попробуйте `/animeadd`."
+            out = "Произошла ошибка при добавлении. Попробуйте `/forum_add`."
     await message.reply(_truncate(out, DISCORD_CONTENT_LIMIT), mention_author=False)
 
 
-@bot.tree.command(name="animeadd", description="Добавить аниме с YummyAnime в форум (ссылка или название)")
+async def _cmd_forum_add(interaction: discord.Interaction, query: str) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message(
+            "Команду можно использовать только на сервере.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
+    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
+
+
+@bot.tree.command(
+    name="forum_add",
+    description="[Форум] Добавить аниме YummyAnime в основной форум и личный список",
+)
+@app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
+async def forum_add(interaction: discord.Interaction, query: str) -> None:
+    await _cmd_forum_add(interaction, query)
+
+
+@bot.tree.command(name="animeadd", description="Алиас /forum_add — добавить аниме в форум")
 @app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
 async def animeadd(interaction: discord.Interaction, query: str) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "Команду можно использовать только на сервере.", ephemeral=True
-        )
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
-    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
+    await _cmd_forum_add(interaction, query)
 
 
-@bot.tree.command(name="addanime", description="Добавить аниме в основной форум и личный список")
+@bot.tree.command(name="addanime", description="Алиас /forum_add")
 @app_commands.describe(query="Ссылка на аниме или название")
 async def addanime(interaction: discord.Interaction, query: str) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "Команду можно использовать только на сервере.", ephemeral=True
-        )
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
-    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
+    await _cmd_forum_add(interaction, query)
 
 
-@bot.tree.command(name="aa", description="Короткий алиас /animeadd — добавить аниме в форум")
+@bot.tree.command(name="aa", description="Короткий алиас /forum_add")
 @app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
 async def aa(interaction: discord.Interaction, query: str) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "Команду можно использовать только на сервере.", ephemeral=True
-        )
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    out = await run_animeadd_for_user(interaction.guild, interaction.user.id, query)
-    await interaction.followup.send(_truncate(out, DISCORD_CONTENT_LIMIT), ephemeral=True)
+    await _cmd_forum_add(interaction, query)
 
 
 def _mal_choice_to_status(choice: str) -> int:
@@ -3611,12 +4036,7 @@ def _format_mal_entry_line(entry: dict[str, Any]) -> str:
     return f"• {t}{prog}{star}"
 
 
-@bot.tree.command(
-    name="malbind",
-    description="Привязать или перепривязать ваш MyAnimeList (делается один раз, при необходимости меняется)",
-)
-@app_commands.describe(list_url="Ссылка на ваш MAL animelist или профиль")
-async def malbind(interaction: discord.Interaction, list_url: str) -> None:
+async def _mal_bind_impl(interaction: discord.Interaction, list_url: str) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
@@ -3638,8 +4058,26 @@ async def malbind(interaction: discord.Interaction, list_url: str) -> None:
 
 
 @bot.tree.command(
-    name="connectmyanimelist",
-    description="Импортировать аниме из уже привязанного MAL в основной форум",
+    name="mal_bind",
+    description="[MAL] Привязать или перепривязать ваш MyAnimeList",
+)
+@app_commands.describe(list_url="Ссылка на ваш MAL animelist или профиль")
+async def mal_bind(interaction: discord.Interaction, list_url: str) -> None:
+    await _mal_bind_impl(interaction, list_url)
+
+
+@bot.tree.command(
+    name="malbind",
+    description="Устаревшее имя — используйте /mal_bind",
+)
+@app_commands.describe(list_url="Ссылка на ваш MAL animelist или профиль")
+async def malbind(interaction: discord.Interaction, list_url: str) -> None:
+    await _mal_bind_impl(interaction, list_url)
+
+
+@bot.tree.command(
+    name="mal_import",
+    description="[MAL] Импортировать аниме из привязанного списка в основной форум",
 )
 @app_commands.describe(
     list_url="(необязательно) новая ссылка MAL для перепривязки перед импортом",
@@ -3656,7 +4094,7 @@ async def malbind(interaction: discord.Interaction, list_url: str) -> None:
         app_commands.Choice(name="Брошено", value="dropped"),
     ]
 )
-async def connectmyanimelist(
+async def _run_mal_import(
     interaction: discord.Interaction,
     mal_status: str,
     list_url: str | None = None,
@@ -3692,7 +4130,7 @@ async def connectmyanimelist(
         acc = state0.get("mal_accounts", {}).get(str(interaction.user.id))
         if not isinstance(acc, dict):
             await interaction.followup.send(
-                "Сначала привяжите MAL командой `/malbind` (или передайте ссылку прямо в `/connectmyanimelist`).",
+                "Сначала привяжите MAL: `/mal_bind` (или укажите ссылку в этой команде).",
                 ephemeral=True,
             )
             return
@@ -3700,7 +4138,7 @@ async def connectmyanimelist(
         norm_url = (acc.get("list_url") or "").strip() or f"https://myanimelist.net/animelist/{username}"
         if not username:
             await interaction.followup.send(
-                "В привязке MAL нет имени пользователя. Выполните `/malbind` заново.",
+                "В привязке MAL нет имени пользователя. Выполните `/mal_bind` заново.",
                 ephemeral=True,
             )
             return
@@ -3914,6 +4352,34 @@ async def connectmyanimelist(
 
 
 @bot.tree.command(
+    name="connectmyanimelist",
+    description="Устаревшее имя — используйте /mal_import",
+)
+@app_commands.describe(
+    list_url="(необязательно) новая ссылка MAL для перепривязки перед импортом",
+    mal_status="Какие позиции брать из списка",
+    max_topics="Сколько новых тем создать за один раз (1–25)",
+)
+@app_commands.choices(
+    mal_status=[
+        app_commands.Choice(name="Все записи", value="all"),
+        app_commands.Choice(name="Смотрю", value="watching"),
+        app_commands.Choice(name="В планах", value="plan_to_watch"),
+        app_commands.Choice(name="Просмотрено", value="completed"),
+        app_commands.Choice(name="Отложено", value="on_hold"),
+        app_commands.Choice(name="Брошено", value="dropped"),
+    ]
+)
+async def connectmyanimelist(
+    interaction: discord.Interaction,
+    mal_status: str,
+    list_url: str | None = None,
+    max_topics: app_commands.Range[int, 1, 25] = 10,
+) -> None:
+    await _run_mal_import(interaction, mal_status, list_url, max_topics)
+
+
+@bot.tree.command(
     name="rateanime",
     description="Поставить оценку 1–10 аниме в этой теме форума (отдельное окно)",
 )
@@ -3935,7 +4401,7 @@ async def rateanime(interaction: discord.Interaction) -> None:
     if not thread_has_rating_slot(state, ch.id):
         await interaction.response.send_message(
             "Эта тема не зарегистрирована для оценок. "
-            "Создайте её через `/animeadd` или импорт из MAL (`/connectmyanimelist`).",
+            "Создайте её через `/forum_add` или импорт из MAL (`/mal_import`).",
             ephemeral=True,
         )
         return
@@ -3947,40 +4413,9 @@ async def rateanime(interaction: discord.Interaction) -> None:
     await interaction.response.send_modal(AnimeRatingModal(ch.id))
 
 
-@bot.tree.command(
-    name="checkanimelist",
-    description="Показать привязанный список MyAnimeList пользователя (с сайта MAL)",
-)
-@app_commands.describe(member="Чей список показать")
-async def checkanimelist(interaction: discord.Interaction, member: discord.Member) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "Команду можно использовать только на сервере.", ephemeral=True
-        )
-        return
-
-    if not bot.session:
-        await interaction.response.send_message(
-            "Сессия HTTP не готова.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(thinking=True)
-    state = await read_state_copy()
-    embed, err = await build_mal_list_embed_for_member(bot.session, state, member)
-    if err:
-        await interaction.followup.send(err)
-        return
-    assert embed is not None
-    await interaction.followup.send(embed=embed)
-
-
-@bot.tree.command(
-    name="myanimelist",
-    description="Список с сайта MyAnimeList (нужна привязка /connectmyanimelist). По умолчанию — ваш аккаунт",
-)
-@app_commands.describe(member="Чей список MAL (необязательно)")
-async def myanimelist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+async def _mal_show_impl(
+    interaction: discord.Interaction, member: discord.Member | None
+) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
@@ -4011,11 +4446,41 @@ async def myanimelist(interaction: discord.Interaction, member: discord.Member |
 
 
 @bot.tree.command(
-    name="animelist",
-    description="Личный Discord-список аниме (как в теме форума списков), без полного сканирования форума",
+    name="mal_show",
+    description="[MAL] Список с сайта MyAnimeList (нужна привязка /mal_bind)",
 )
-@app_commands.describe(member="Чей список (если не указано — ваш)")
-async def animelist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
+@app_commands.describe(member="Чей список (по умолчанию ваш)")
+async def mal_show(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mal_show_impl(interaction, member)
+
+
+@bot.tree.command(
+    name="checkanimelist",
+    description="Устар.: используйте /mal_show",
+)
+@app_commands.describe(member="Чей список показать (по умолчанию вы)")
+async def checkanimelist(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mal_show_impl(interaction, member)
+
+
+@bot.tree.command(
+    name="myanimelist",
+    description="Устар.: используйте /mal_show",
+)
+@app_commands.describe(member="Чей список MAL (необязательно)")
+async def myanimelist(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mal_show_impl(interaction, member)
+
+
+async def _mylist_show_impl(
+    interaction: discord.Interaction, member: discord.Member | None
+) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
@@ -4042,12 +4507,36 @@ async def animelist(interaction: discord.Interaction, member: discord.Member | N
 
 
 @bot.tree.command(
+    name="mylist_show",
+    description="[Мой список] Личный Discord-лист (как в теме форума списков)",
+)
+@app_commands.describe(member="Чей список (если не указано — ваш)")
+async def mylist_show(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mylist_show_impl(interaction, member)
+
+
+@bot.tree.command(
+    name="animelist",
+    description="Устар.: используйте /mylist_show",
+)
+@app_commands.describe(member="Чей список (если не указано — ваш)")
+async def animelist(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mylist_show_impl(interaction, member)
+
+
+@bot.tree.command(
     name="mylist",
-    description="Показать личный список аниме пользователя (Discord-список)",
+    description="Устар.: используйте /mylist_show",
 )
 @app_commands.describe(member="Чей список показать (если не указано — ваш)")
-async def mylist(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
-    await animelist(interaction, member)
+async def mylist(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mylist_show_impl(interaction, member)
 
 
 async def _personal_slug_autocomplete(
@@ -4080,42 +4569,18 @@ async def _personal_slug_autocomplete(
 
 @bot.tree.command(
     name="checkanime",
-    description="Список аниме из личного Discord-листа (без обхода всего форума)",
+    description="Устар.: используйте /mylist_show",
 )
 @app_commands.describe(member="Чей список показать (по умолчанию ваш)")
-async def checkanime(interaction: discord.Interaction, member: discord.Member | None = None) -> None:
-    if not interaction.guild:
-        await interaction.response.send_message(
-            "Команду можно использовать только на сервере.", ephemeral=True
-        )
-        return
-    raw_target = member or interaction.user
-    target = (
-        raw_target
-        if isinstance(raw_target, discord.Member)
-        else interaction.guild.get_member(raw_target.id)
-    )
-    if target is None:
-        await interaction.response.send_message(
-            "Укажите участника этого сервера.", ephemeral=True
-        )
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    embed, err, _s, _u = await run_animelist_discord_topics(interaction.guild, target)
-    if err:
-        await interaction.followup.send(_truncate(err, DISCORD_CONTENT_LIMIT), ephemeral=True)
-        return
-    assert embed is not None
-    await interaction.followup.send(embed=embed, ephemeral=True)
+async def checkanime(
+    interaction: discord.Interaction, member: discord.Member | None = None
+) -> None:
+    await _mylist_show_impl(interaction, member)
 
 
-@bot.tree.command(
-    name="syncanimelist",
-    description="[Администраторы] Синхронизировать личный список участника с темами основного форума",
-)
-@app_commands.describe(member="Чей список пересобрать из базы бота")
-@app_commands.default_permissions(administrator=True)
-async def syncanimelist(interaction: discord.Interaction, member: discord.Member) -> None:
+async def _admin_sync_personal_from_forum(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
@@ -4151,23 +4616,64 @@ async def syncanimelist(interaction: discord.Interaction, member: discord.Member
 
 
 @bot.tree.command(
-    name="syncmylist",
-    description="[Администраторы] Пересобрать личный список участника из основного форума",
+    name="mylist_admin_sync",
+    description="[Админ] Синхронизировать личный список участника с темами основного форума",
 )
-@app_commands.describe(member="Чей личный список пересобрать")
+@app_commands.describe(member="Чей список пересобрать из базы бота")
 @app_commands.default_permissions(administrator=True)
-async def syncmylist(interaction: discord.Interaction, member: discord.Member) -> None:
-    await syncanimelist(interaction, member)
+async def mylist_admin_sync(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
+    await _admin_sync_personal_from_forum(interaction, member)
 
 
 @bot.tree.command(
-    name="yummybind",
-    description="Привязать аккаунт YummyAnime (Bearer-токен из браузера после входа на сайт)",
+    name="syncanimelist",
+    description="Устар.: используйте /mylist_admin_sync",
 )
-@app_commands.describe(
-    bearer_token="Токен: вкладка Сеть (Network) → любой запрос к api.yani.tv → Authorization: Bearer …"
+@app_commands.describe(member="Чей список пересобрать из базы бота")
+@app_commands.default_permissions(administrator=True)
+async def syncanimelist(
+    interaction: discord.Interaction, member: discord.Member
+) -> None:
+    await _admin_sync_personal_from_forum(interaction, member)
+
+
+@bot.tree.command(
+    name="yummy_link",
+    description="[Yummy] Ссылка для входа на сайте — токен привяжется после кнопки в Discord",
 )
-async def yummybind(interaction: discord.Interaction, bearer_token: str) -> None:
+async def yummy_link(interaction: discord.Interaction) -> None:
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.response.send_message(
+            "Владелец бота должен задать **YUMMY_APPLICATION_TOKEN** (приложение на https://yummyani.me/dev/applications).",
+            ephemeral=True,
+        )
+        return
+    public = (os.environ.get("YUMMY_LINK_PUBLIC_URL") or "").strip().rstrip("/")
+    port = (os.environ.get("YUMMY_LINK_HTTP_PORT") or "").strip()
+    if not public or not port:
+        await interaction.response.send_message(
+            "Веб-вход не настроен: в `.env` укажите **YUMMY_LINK_PUBLIC_URL** (как вас видит интернет, "
+            "например `https://bot.example.com`) и **YUMMY_LINK_HTTP_PORT** (локальный порт, на котором "
+            "бот слушает HTTP; прокси nginx/caddy перенаправляет на него `/yummy-link`).\n\n"
+            "Пока можно привязать аккаунт вручную: **`/yummy_token`** с Bearer из DevTools.",
+            ephemeral=True,
+        )
+        return
+    tok = await yummy_link_create_session(interaction.user.id)
+    url = f"{public}/yummy-link?token={quote(tok, safe='')}"
+    view = YummyLinkVerifyView()
+    await interaction.response.send_message(
+        "1. Откройте ссылку и войдите в аккаунт YummyAnime (как на сайте).\n"
+        f"2. После успешного входа нажмите кнопку ниже.\n\n{url}",
+        view=view,
+        ephemeral=True,
+    )
+
+
+async def _yummy_token_impl(interaction: discord.Interaction, bearer_token: str) -> None:
     await interaction.response.defer(ephemeral=True, thinking=True)
     app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
     if not app:
@@ -4204,14 +4710,35 @@ async def yummybind(interaction: discord.Interaction, bearer_token: str) -> None
     nick = str(prof.get("nickname") or "")
     await bind_yummy_account(interaction.user.id, t, yid_i, nick)
     await interaction.followup.send(
-        f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/syncyummy` или кнопка **Yummy ↻** в личной теме.\n"
+        f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/yummy_sync` или кнопка **Yummy ↻** в личной теме.\n"
         "_Токен хранится на сервере с ботом; не пересылайте его третьим лицам._",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="yummyunbind", description="Отвязать аккаунт YummyAnime от Discord-профиля")
-async def yummyunbind(interaction: discord.Interaction) -> None:
+@bot.tree.command(
+    name="yummy_token",
+    description="[Yummy] Привязать Bearer-токен вручную (из DevTools браузера после входа на сайт)",
+)
+@app_commands.describe(
+    bearer_token="Токен: Network → запрос к api.yani.tv → Authorization: Bearer …"
+)
+async def yummy_token(interaction: discord.Interaction, bearer_token: str) -> None:
+    await _yummy_token_impl(interaction, bearer_token)
+
+
+@bot.tree.command(
+    name="yummybind",
+    description="Устар.: используйте /yummy_link или /yummy_token",
+)
+@app_commands.describe(
+    bearer_token="Токен: вкладка Сеть (Network) → любой запрос к api.yani.tv → Authorization: Bearer …"
+)
+async def yummybind(interaction: discord.Interaction, bearer_token: str) -> None:
+    await _yummy_token_impl(interaction, bearer_token)
+
+
+async def _yummy_unbind_impl(interaction: discord.Interaction) -> None:
     await unbind_yummy_account(interaction.user.id)
     await interaction.response.send_message(
         "Привязка YummyAnime снята. История импортов (`imported_yummy`) сохранена — повторный импорт не продублирует темы.",
@@ -4220,27 +4747,25 @@ async def yummyunbind(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(
-    name="syncyummy",
-    description="Подтянуть новые аниме из вашего списка YummyAnime в основной форум и личный топик",
+    name="yummy_unbind",
+    description="[Yummy] Отвязать аккаунт YummyAnime от Discord-профиля",
 )
-@app_commands.describe(
-    yummy_list="Какой список на Yummy учитывать",
-    max_topics="Максимум новых тем за один раз (1–25)",
+async def yummy_unbind(interaction: discord.Interaction) -> None:
+    await _yummy_unbind_impl(interaction)
+
+
+@bot.tree.command(
+    name="yummyunbind",
+    description="Устар.: используйте /yummy_unbind",
 )
-@app_commands.choices(
-    yummy_list=[
-        app_commands.Choice(name="Все списки", value="all"),
-        app_commands.Choice(name="Смотрю", value="watching"),
-        app_commands.Choice(name="В планах", value="plan_to_watch"),
-        app_commands.Choice(name="Просмотрено", value="completed"),
-        app_commands.Choice(name="Отложено", value="on_hold"),
-        app_commands.Choice(name="Брошено", value="dropped"),
-    ]
-)
-async def syncyummy(
+async def yummyunbind(interaction: discord.Interaction) -> None:
+    await _yummy_unbind_impl(interaction)
+
+
+async def _run_yummy_sync(
     interaction: discord.Interaction,
     yummy_list: str,
-    max_topics: app_commands.Range[int, 1, 25] = 15,
+    max_topics: app_commands.Range[int, 1, 25],
 ) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
@@ -4290,6 +4815,161 @@ async def syncyummy(
     )
 
 
+@bot.tree.command(
+    name="yummy_sync",
+    description="[Yummy] Импорт новых аниме из списка YummyAnime в основной форум и личный топик",
+)
+@app_commands.describe(
+    yummy_list="Какой список на Yummy учитывать",
+    max_topics="Максимум новых тем за один раз (1–25)",
+)
+@app_commands.choices(
+    yummy_list=[
+        app_commands.Choice(name="Все списки", value="all"),
+        app_commands.Choice(name="Смотрю", value="watching"),
+        app_commands.Choice(name="В планах", value="plan_to_watch"),
+        app_commands.Choice(name="Просмотрено", value="completed"),
+        app_commands.Choice(name="Отложено", value="on_hold"),
+        app_commands.Choice(name="Брошено", value="dropped"),
+    ]
+)
+async def yummy_sync(
+    interaction: discord.Interaction,
+    yummy_list: str,
+    max_topics: app_commands.Range[int, 1, 25] = 15,
+) -> None:
+    await _run_yummy_sync(interaction, yummy_list, max_topics)
+
+
+@bot.tree.command(
+    name="syncyummy",
+    description="Устар.: используйте /yummy_sync",
+)
+@app_commands.describe(
+    yummy_list="Какой список на Yummy учитывать",
+    max_topics="Максимум новых тем за один раз (1–25)",
+)
+@app_commands.choices(
+    yummy_list=[
+        app_commands.Choice(name="Все списки", value="all"),
+        app_commands.Choice(name="Смотрю", value="watching"),
+        app_commands.Choice(name="В планах", value="plan_to_watch"),
+        app_commands.Choice(name="Просмотрено", value="completed"),
+        app_commands.Choice(name="Отложено", value="on_hold"),
+        app_commands.Choice(name="Брошено", value="dropped"),
+    ]
+)
+async def syncyummy(
+    interaction: discord.Interaction,
+    yummy_list: str,
+    max_topics: app_commands.Range[int, 1, 25] = 15,
+) -> None:
+    await _run_yummy_sync(interaction, yummy_list, max_topics)
+
+
+@bot.tree.command(
+    name="yummy_status",
+    description="[Yummy] Показать, привязан ли аккаунт YummyAnime к вашему Discord",
+)
+async def yummy_status(interaction: discord.Interaction) -> None:
+    state = await read_state_copy()
+    acc = (state.get("yummy_accounts") or {}).get(str(interaction.user.id))
+    if not isinstance(acc, dict):
+        await interaction.response.send_message(
+            "Аккаунт YummyAnime **не привязан**. Используйте `/yummy_link` (веб-вход) или `/yummy_token`.",
+            ephemeral=True,
+        )
+        return
+    nick = str(acc.get("nickname") or "")
+    yid = acc.get("yummy_user_id")
+    await interaction.response.send_message(
+        f"Привязан: **{nick or yid}** (id Yummy: `{yid}`). Импорт: `/yummy_sync`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="yummy_list",
+    description="[Yummy] Показать записи из вашего списка на YummyAnime (без создания тем в Discord)",
+)
+@app_commands.describe(
+    yummy_list="Какой список показать",
+    limit="Сколько строк вывести (1–40)",
+)
+@app_commands.choices(
+    yummy_list=[
+        app_commands.Choice(name="Все списки", value="all"),
+        app_commands.Choice(name="Смотрю", value="watching"),
+        app_commands.Choice(name="В планах", value="plan_to_watch"),
+        app_commands.Choice(name="Просмотрено", value="completed"),
+        app_commands.Choice(name="Отложено", value="on_hold"),
+        app_commands.Choice(name="Брошено", value="dropped"),
+    ]
+)
+async def yummy_list_cmd(
+    interaction: discord.Interaction,
+    yummy_list: str,
+    limit: app_commands.Range[int, 1, 40] = 20,
+) -> None:
+    app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+    if not app:
+        await interaction.response.send_message(
+            "Не задан **YUMMY_APPLICATION_TOKEN**.", ephemeral=True
+        )
+        return
+    if not bot.session:
+        await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+        return
+    state = await read_state_copy()
+    acc = (state.get("yummy_accounts") or {}).get(str(interaction.user.id))
+    if not isinstance(acc, dict):
+        await interaction.response.send_message(
+            "Сначала привяжите аккаунт: `/yummy_link` или `/yummy_token`.", ephemeral=True
+        )
+        return
+    yuid = acc.get("yummy_user_id")
+    bearer = (acc.get("access_token") or "").strip()
+    if yuid is None or not bearer:
+        await interaction.response.send_message("Неполная привязка YummyAnime.", ephemeral=True)
+        return
+    try:
+        yuid_i = int(yuid)
+    except (TypeError, ValueError):
+        await interaction.response.send_message("Некорректный yummy_user_id в базе.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    items, new_tok, err_msg = await yummy_api.yani_fetch_lists_with_token_refresh(
+        bot.session, app, bearer, yuid_i, USER_AGENT
+    )
+    if err_msg:
+        await interaction.followup.send(
+            _truncate(err_msg, DISCORD_CONTENT_LIMIT), ephemeral=True
+        )
+        return
+    if new_tok:
+        await update_yummy_access_token(interaction.user.id, new_tok)
+    entries = yummy_api.filter_yummy_entries_by_status(items or [], yummy_list)
+    lines: list[str] = []
+    for e in entries[: int(limit)]:
+        title = yummy_api.yummy_entry_title(e)
+        url = yummy_api.yummy_entry_anime_url(e)
+        if url:
+            lines.append(f"• [{title}]({url})")
+        else:
+            lines.append(f"• {title}")
+    body = "\n".join(lines) if lines else "_Пусто для выбранного фильтра._"
+    if len(entries) > int(limit):
+        body += f"\n_…всего записей: **{len(entries)}**_"
+    nick = str(acc.get("nickname") or "")
+    embed = discord.Embed(
+        title=f"YummyAnime — {nick or yuid_i}",
+        description=_truncate(body, EMBED_DESC_LIMIT),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text="Только просмотр; темы в Discord создаёт /yummy_sync")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 admin_cmd_group = app_commands.Group(
     name="admin",
     description="Админ: YummyAnime, скан форума, личные списки, обновление тем",
@@ -4301,7 +4981,7 @@ admin_cmd_group = app_commands.Group(
     description="Принудительно синхронизировать список Yummy участника с форумом",
 )
 @app_commands.describe(
-    member="Участник с привязкой /yummybind",
+    member="Участник с привязкой Yummy (/yummy_link или /yummy_token)",
     max_topics="Максимум новых тем за запуск (1–25)",
 )
 async def admin_yummy_resync(
@@ -4620,25 +5300,7 @@ async def adminpanel(interaction: discord.Interaction) -> None:
     )
 
 
-@bot.tree.command(
-    name="settopanime",
-    description="Задать до 5 аниме для блока «Топ» в вашей личной теме списка",
-)
-@app_commands.describe(
-    slot1="1-е место топа",
-    slot2="2-е место",
-    slot3="3-е место",
-    slot4="4-е место",
-    slot5="5-е место",
-)
-@app_commands.autocomplete(
-    slot1=_personal_slug_autocomplete,
-    slot2=_personal_slug_autocomplete,
-    slot3=_personal_slug_autocomplete,
-    slot4=_personal_slug_autocomplete,
-    slot5=_personal_slug_autocomplete,
-)
-async def settopanime(
+async def _mylist_top_impl(
     interaction: discord.Interaction,
     slot1: str | None = None,
     slot2: str | None = None,
@@ -4662,7 +5324,7 @@ async def settopanime(
     pl = (state.get("personal_lists") or {}).get(uid_s)
     if not isinstance(pl, dict):
         await interaction.followup.send(
-            "Личного списка ещё нет — сначала добавьте аниме через `/animeadd`.",
+            "Личного списка ещё нет — сначала добавьте аниме через `/forum_add`.",
             ephemeral=True,
         )
         return
@@ -4708,10 +5370,68 @@ async def settopanime(
 
 
 @bot.tree.command(
-    name="mytopicpanel",
-    description="Восстановить панель кнопок в личной теме (если кнопки не работают после рестарта)",
+    name="mylist_top",
+    description="[Мой список] До 5 аниме для блока «Топ» в личной теме",
 )
-async def mytopicpanel(interaction: discord.Interaction) -> None:
+@app_commands.describe(
+    slot1="1-е место топа",
+    slot2="2-е место",
+    slot3="3-е место",
+    slot4="4-е место",
+    slot5="5-е место",
+)
+@app_commands.autocomplete(
+    slot1=_personal_slug_autocomplete,
+    slot2=_personal_slug_autocomplete,
+    slot3=_personal_slug_autocomplete,
+    slot4=_personal_slug_autocomplete,
+    slot5=_personal_slug_autocomplete,
+)
+async def mylist_top(
+    interaction: discord.Interaction,
+    slot1: str | None = None,
+    slot2: str | None = None,
+    slot3: str | None = None,
+    slot4: str | None = None,
+    slot5: str | None = None,
+) -> None:
+    await _mylist_top_impl(
+        interaction, slot1, slot2, slot3, slot4, slot5
+    )
+
+
+@bot.tree.command(
+    name="settopanime",
+    description="Устар.: используйте /mylist_top",
+)
+@app_commands.describe(
+    slot1="1-е место топа",
+    slot2="2-е место",
+    slot3="3-е место",
+    slot4="4-е место",
+    slot5="5-е место",
+)
+@app_commands.autocomplete(
+    slot1=_personal_slug_autocomplete,
+    slot2=_personal_slug_autocomplete,
+    slot3=_personal_slug_autocomplete,
+    slot4=_personal_slug_autocomplete,
+    slot5=_personal_slug_autocomplete,
+)
+async def settopanime(
+    interaction: discord.Interaction,
+    slot1: str | None = None,
+    slot2: str | None = None,
+    slot3: str | None = None,
+    slot4: str | None = None,
+    slot5: str | None = None,
+) -> None:
+    await _mylist_top_impl(
+        interaction, slot1, slot2, slot3, slot4, slot5
+    )
+
+
+async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
             "Команду можно использовать только на сервере.", ephemeral=True
@@ -4761,17 +5481,25 @@ async def mytopicpanel(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(
-    name="editmyanimelist",
-    description="Изменить название и первый пост в вашей личной теме списка аниме",
+    name="mylist_panel",
+    description="[Мой список] Восстановить панель кнопок в личной теме",
 )
-@app_commands.describe(
-    name="Новое название темы форума",
-    description="Новый текст первого сообщения в теме",
+async def mylist_panel(interaction: discord.Interaction) -> None:
+    await _mylist_panel_impl(interaction)
+
+
+@bot.tree.command(
+    name="mytopicpanel",
+    description="Устар.: используйте /mylist_panel",
 )
-async def editmyanimelist(
+async def mytopicpanel(interaction: discord.Interaction) -> None:
+    await _mylist_panel_impl(interaction)
+
+
+async def _mylist_edit_impl(
     interaction: discord.Interaction,
-    name: str | None = None,
-    description: str | None = None,
+    name: str | None,
+    description: str | None,
 ) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
@@ -4790,7 +5518,7 @@ async def editmyanimelist(
     pl = (state.get("personal_lists") or {}).get(uid_s)
     if not isinstance(pl, dict) or not pl.get("thread_id"):
         await interaction.response.send_message(
-            "Личной темы ещё нет — она создаётся при первом добавлении аниме в основной форум.",
+            "Личной темы ещё нет — она создаётся при первом добавлении аниме (`/forum_add`).",
             ephemeral=True,
         )
         return
@@ -4830,6 +5558,38 @@ async def editmyanimelist(
             return
 
     await interaction.followup.send("Готово.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="mylist_edit",
+    description="[Мой список] Изменить название и первый пост личной темы",
+)
+@app_commands.describe(
+    name="Новое название темы форума",
+    description="Новый текст первого сообщения в теме",
+)
+async def mylist_edit(
+    interaction: discord.Interaction,
+    name: str | None = None,
+    description: str | None = None,
+) -> None:
+    await _mylist_edit_impl(interaction, name, description)
+
+
+@bot.tree.command(
+    name="editmyanimelist",
+    description="Устар.: используйте /mylist_edit",
+)
+@app_commands.describe(
+    name="Новое название темы форума",
+    description="Новый текст первого сообщения в теме",
+)
+async def editmyanimelist(
+    interaction: discord.Interaction,
+    name: str | None = None,
+    description: str | None = None,
+) -> None:
+    await _mylist_edit_impl(interaction, name, description)
 
 
 @bot.tree.command(

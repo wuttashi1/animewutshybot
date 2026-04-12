@@ -56,6 +56,56 @@ async def _yani_request(
         return None, 0
 
 
+async def yani_login(
+    session: aiohttp.ClientSession,
+    app_token: str,
+    login_email: str,
+    password: str,
+    captcha_response: str | None,
+    user_agent: str,
+) -> tuple[str | None, str | None, int]:
+    """
+    POST /profile/login (без Bearer). Возвращает (access_token, сообщение_ошибки, http_status).
+    """
+    url = f"{YANI_BASE}/profile/login"
+    headers = build_yani_headers(app_token, None, user_agent)
+    headers["Content-Type"] = "application/json"
+    body: dict[str, Any] = {
+        "login": login_email.strip(),
+        "password": password,
+        "need_json": True,
+    }
+    cr = (captcha_response or "").strip()
+    if cr:
+        body["recaptcha_response"] = cr
+    try:
+        async with session.post(url, headers=headers, json=body) as resp:
+            status = resp.status
+            try:
+                data = await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError):
+                text = await resp.text()
+                logger.warning("YANI login non-JSON: %s", text[:200])
+                return None, "Неожиданный ответ API при входе.", status
+            if not isinstance(data, dict):
+                return None, "Некорректный ответ API.", status
+            inner = data.get("response")
+            if isinstance(inner, dict):
+                tok = inner.get("token")
+                if isinstance(tok, str) and tok.strip():
+                    return tok.strip(), None, status
+                err = inner.get("message") or inner.get("error")
+                if isinstance(err, str) and err.strip():
+                    return None, err.strip(), status
+            err = data.get("message") or data.get("error")
+            if isinstance(err, str) and err.strip():
+                return None, err.strip(), status
+            return None, "Вход не удался (нет токена в ответе).", status
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning("YANI login request failed: %s", e)
+        return None, "Сеть недоступна.", 0
+
+
 async def yani_get_profile(
     session: aiohttp.ClientSession,
     app_token: str,
@@ -138,7 +188,7 @@ async def yani_fetch_lists_with_token_refresh(
     if st == 401:
         new_tok = await yani_refresh_access_token(session, app_token, bearer, user_agent)
         if not new_tok:
-            return None, None, "Сессия YummyAnime недействительна — выполните `/yummybind` снова."
+            return None, None, "Сессия YummyAnime недействительна — выполните `/yummy_link` или `/yummy_token` снова."
         items2, st2 = await yani_get_user_lists(
             session, app_token, new_tok, yummy_user_id, user_agent
         )
