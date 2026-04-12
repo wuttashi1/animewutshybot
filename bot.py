@@ -1742,7 +1742,7 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
     )
     forum_rows = [
         (
-            "`/forum_add` · `/aa` · `/animeadd` · `/addanime`",
+            "`/forum_add` · `/aa` · `/animeadd`",
             "Добавить аниме YummyAnime в **основной форум** и в **ваш личный список** (ссылка или название).",
         ),
         (
@@ -1766,12 +1766,12 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
         color=EMBED_COLOR,
     )
     mylist_rows = [
-        ("`/mylist_show` · `/checkanime`", "Показать ваш (или указанного участника) список из данных бота."),
+        ("`/mylist_show`", "Показать ваш (или указанного участника) список из данных бота."),
         ("`/mylist_edit`", "Название и первый пост **вашей** личной темы."),
-        ("`/mylist_top` · `/settopanime`", "До **5** аниме для блока «Топ» на карточках."),
-        ("`/mylist_panel` · `/mytopicpanel`", "Восстановить панель кнопок в личной теме."),
+        ("`/mylist_top`", "До **5** аниме для блока «Топ» на карточках."),
+        ("`/mylist_panel`", "Восстановить панель кнопок в личной теме."),
         (
-            "`/mylist_admin_sync` · `/syncanimelist`",
+            "`/mylist_admin_sync`",
             "**Админы:** сначала обновляется состояние **основного форума**, затем пересобирается **личный** список участника и карточки.",
         ),
     ]
@@ -1800,8 +1800,8 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
         color=EMBED_COLOR,
     )
     mal_rows = [
-        ("`/mal_bind` · `/malbind`", "Привязать ник MAL по ссылке на animelist или профиль."),
-        ("`/mal_import` · `/connectmyanimelist`", "Импорт позиций из MAL в форум (через поиск Yummy или только MAL)."),
+        ("`/mal_bind`", "Привязать ник MAL по ссылке на animelist или профиль."),
+        ("`/mal_import`", "Импорт позиций из MAL в форум (через поиск Yummy или только MAL)."),
         ("`/mal_show`", "Показать фрагмент списка с сайта MAL."),
     ]
     for name, val in mal_rows:
@@ -1814,8 +1814,8 @@ def _build_bot_info_embed_groups() -> list[list[discord.Embed]]:
     admin_rows = [
         (
             "`/admin`",
-            "Подкоманды: `yummy_resync`, `yummy_status`, `forum_scan`, `personal_rebuild`, "
-            "`repair_topics`, **`refresh_help_thread`** (обновить эту справку).",
+            "Подкоманды: `diagnostics`, `yummy_resync`, `yummy_status`, `forum_scan`, "
+            "`personal_rebuild`, `repair_topics`, **`refresh_help_thread`** (обновить эту справку).",
         ),
         ("`/adminpanel`", "Меню быстрых действий (скан форума, ремонт тем, статус фона Yummy)."),
         (
@@ -3112,6 +3112,7 @@ async def append_user_anime_to_personal_state(
     if not key:
         return
     title = (title or "").strip() or _title_for_list_key(await read_state_copy(), key)
+    merged_same_forum_thread = False
     async with _state_lock:
         data = _load_state()
         uid = str(user_id)
@@ -3130,28 +3131,17 @@ async def append_user_anime_to_personal_state(
                     pl["order"] = order
                     data["personal_lists"][uid] = pl
                     _write_state(data)
-                    member = guild.get_member(user_id)
-                    if member is None:
-                        try:
-                            member = await guild.fetch_member(user_id)
-                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                            logger.warning(
-                                "Не удалось получить участника %s для личного списка.", user_id
-                            )
-                            return
-                    await ensure_personal_list_thread(
-                        bot, guild, member, session=bot.session
-                    )
-                    schedule_personal_list_refresh(guild.id, user_id)
-                    return
-        if key not in order:
-            order.append(key)
-        pl["order"] = order
-        st = data.setdefault("slug_titles", {})
-        st[key] = title[:500]
-        data["slug_titles"] = st
-        data["personal_lists"][uid] = pl
-        _write_state(data)
+                    merged_same_forum_thread = True
+                    break
+        if not merged_same_forum_thread:
+            if key not in order:
+                order.append(key)
+            pl["order"] = order
+            st = data.setdefault("slug_titles", {})
+            st[key] = title[:500]
+            data["slug_titles"] = st
+            data["personal_lists"][uid] = pl
+            _write_state(data)
 
     member = guild.get_member(user_id)
     if member is None:
@@ -4667,7 +4657,7 @@ async def run_animelist_discord_topics(
         return (
             None,
             f"{target.mention} — в личном списке пока нет записей. "
-            "Они появляются при добавлении аниме в основной форум (`/addanime`). "
+            "Они появляются при добавлении аниме в основной форум (`/forum_add`). "
             "Если вы уже добавляли раньше, админ может выполнить `/mylist_admin_sync` для вашего профиля.",
             0,
             0,
@@ -4760,12 +4750,6 @@ async def animeadd(interaction: discord.Interaction, query: str) -> None:
     await _cmd_forum_add(interaction, query)
 
 
-@bot.tree.command(name="addanime", description="Алиас /forum_add")
-@app_commands.describe(query="Ссылка на аниме или название")
-async def addanime(interaction: discord.Interaction, query: str) -> None:
-    await _cmd_forum_add(interaction, query)
-
-
 @bot.tree.command(name="aa", description="Короткий алиас /forum_add")
 @app_commands.describe(query="Ссылка на страницу аниме или поисковый запрос")
 async def aa(interaction: discord.Interaction, query: str) -> None:
@@ -4824,15 +4808,6 @@ async def _mal_bind_impl(interaction: discord.Interaction, list_url: str) -> Non
 )
 @app_commands.describe(list_url="Ссылка на ваш MAL animelist или профиль")
 async def mal_bind(interaction: discord.Interaction, list_url: str) -> None:
-    await _mal_bind_impl(interaction, list_url)
-
-
-@bot.tree.command(
-    name="malbind",
-    description="Устаревшее имя — используйте /mal_bind",
-)
-@app_commands.describe(list_url="Ссылка на ваш MAL animelist или профиль")
-async def malbind(interaction: discord.Interaction, list_url: str) -> None:
     await _mal_bind_impl(interaction, list_url)
 
 
@@ -5079,7 +5054,7 @@ async def _run_mal_import(
                 pt = mal_item_title(entry)
             await append_user_anime_to_personal_state(interaction.guild, uid, pk, pt)
         except Exception:
-            logger.exception("Личный список после новой темы из connectmyanimelist")
+            logger.exception("Личный список после новой темы из mal_import")
 
         await mark_mal_imported(interaction.user.id, aid)
         imported_ids.add(aid)
@@ -5110,34 +5085,6 @@ async def _run_mal_import(
     await interaction.followup.send(
         _truncate("\n".join(lines), DISCORD_CONTENT_LIMIT), ephemeral=True
     )
-
-
-@bot.tree.command(
-    name="connectmyanimelist",
-    description="Устаревшее имя — используйте /mal_import",
-)
-@app_commands.describe(
-    list_url="(необязательно) новая ссылка MAL для перепривязки перед импортом",
-    mal_status="Какие позиции брать из списка",
-    max_topics="Сколько новых тем создать за один раз (1–25)",
-)
-@app_commands.choices(
-    mal_status=[
-        app_commands.Choice(name="Все записи", value="all"),
-        app_commands.Choice(name="Смотрю", value="watching"),
-        app_commands.Choice(name="В планах", value="plan_to_watch"),
-        app_commands.Choice(name="Просмотрено", value="completed"),
-        app_commands.Choice(name="Отложено", value="on_hold"),
-        app_commands.Choice(name="Брошено", value="dropped"),
-    ]
-)
-async def connectmyanimelist(
-    interaction: discord.Interaction,
-    mal_status: str,
-    list_url: str | None = None,
-    max_topics: app_commands.Range[int, 1, 25] = 10,
-) -> None:
-    await _run_mal_import(interaction, mal_status, list_url, max_topics)
 
 
 @bot.tree.command(
@@ -5328,17 +5275,6 @@ async def _personal_slug_autocomplete(
     return choices
 
 
-@bot.tree.command(
-    name="checkanime",
-    description="Устар.: используйте /mylist_show",
-)
-@app_commands.describe(member="Чей список показать (по умолчанию ваш)")
-async def checkanime(
-    interaction: discord.Interaction, member: discord.Member | None = None
-) -> None:
-    await _mylist_show_impl(interaction, member)
-
-
 async def _admin_sync_personal_from_forum(
     interaction: discord.Interaction, member: discord.Member
 ) -> None:
@@ -5376,7 +5312,7 @@ async def _admin_sync_personal_from_forum(
             bot, interaction.guild.id, member.id, session=sess
         )
     except Exception:
-        logger.exception("syncanimelist: обновление личной темы")
+        logger.exception("mylist_admin_sync: обновление личной темы")
     parts = [
         f"Основной форум: просмотрено веток **{scanned}**, обновлено записей **{updated}**.",
         f"В личном списке **{member.display_name}**: **{n}** позиций.",
@@ -5399,18 +5335,6 @@ async def _admin_sync_personal_from_forum(
 @app_commands.describe(member="Чей список пересобрать из базы бота")
 @app_commands.default_permissions(administrator=True)
 async def mylist_admin_sync(
-    interaction: discord.Interaction, member: discord.Member
-) -> None:
-    await _admin_sync_personal_from_forum(interaction, member)
-
-
-@bot.tree.command(
-    name="syncanimelist",
-    description="Устар.: используйте /mylist_admin_sync",
-)
-@app_commands.describe(member="Чей список пересобрать из базы бота")
-@app_commands.default_permissions(administrator=True)
-async def syncanimelist(
     interaction: discord.Interaction, member: discord.Member
 ) -> None:
     await _admin_sync_personal_from_forum(interaction, member)
@@ -5749,9 +5673,43 @@ async def yummy_list_cmd(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+def _build_admin_diagnostics_embed() -> discord.Embed:
+    n_tasks = len(_personal_rebuild_tasks)
+    n_active = sum(1 for t in _personal_rebuild_tasks.values() if not t.done())
+    mongo_on = mongo_store.mongo_enabled()
+    mongo_ping = mongo_store.ping() if mongo_on else False
+    lf = mongo_store.local_first_enabled()
+    sess = bot.session
+    http_ok = sess is not None and not sess.closed
+    lines = [
+        f"**Личные списки:** слотов отложенной пересборки **{n_tasks}**, из них активных задач **{n_active}**.",
+        f"**Состояние (поколения):** main pending **{_main_cloud_push_pending()}** "
+        f"(gen **{_main_cloud_gen}** / ack **{_last_main_cloud_push_gen}**), "
+        f"yummy pending **{_yummy_cloud_push_pending()}** "
+        f"(gen **{_yummy_cloud_gen}** / ack **{_last_yummy_cloud_push_gen}**).",
+        f"**HTTP-сессия бота:** {'готова' if http_ok else 'нет или закрыта'}.",
+    ]
+    if mongo_on:
+        lines.append(
+            f"**MongoDB:** URI задан · БД `{mongo_store.database_name()}` · ping **{'ok' if mongo_ping else 'fail'}** · "
+            f"local_first **{'on' if lf else 'off'}** · flush **{mongo_store.cloud_flush_interval_sec()}** с."
+        )
+    else:
+        lines.append("**MongoDB:** не используется (нет `MONGODB_URI`).")
+    embed = discord.Embed(
+        title="Диагностика бота",
+        description="\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(
+        text="Если после добавления аниме «всё висит», проверьте логи и число активных пересборок."
+    )
+    return embed
+
+
 admin_cmd_group = app_commands.Group(
     name="admin",
-    description="Админ: YummyAnime, скан форума, личные списки, справочная ветка, ремонт тем",
+    description="Админ: диагностика, YummyAnime, скан форума, личные списки, справка, ремонт тем",
 )
 
 
@@ -5889,6 +5847,20 @@ async def admin_refresh_help_thread(interaction: discord.Interaction) -> None:
 
 
 @admin_cmd_group.command(
+    name="diagnostics",
+    description="Сводка: отложенные пересборки личных списков, Mongo, HTTP-сессия",
+)
+async def admin_diagnostics(interaction: discord.Interaction) -> None:
+    ok, err = _admin_member_ok(interaction)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=_build_admin_diagnostics_embed(), ephemeral=True
+    )
+
+
+@admin_cmd_group.command(
     name="personal_rebuild",
     description="Пересоздать карточки в личной теме участника",
 )
@@ -5984,6 +5956,11 @@ class AdminPanelView(discord.ui.View):
         custom_id="adminpanel:menu",
         options=[
             discord.SelectOption(
+                label="Диагностика",
+                value="diagnostics",
+                description="Пересборки личных списков, Mongo, HTTP, поколения состояния",
+            ),
+            discord.SelectOption(
                 label="Статус фона Yummy",
                 value="yummy_status",
                 description="Последний автоматический опрос списков",
@@ -6013,6 +5990,11 @@ class AdminPanelView(discord.ui.View):
             await interaction.response.send_message(err, ephemeral=True)
             return
         choice = select.values[0]
+        if choice == "diagnostics":
+            await interaction.response.send_message(
+                embed=_build_admin_diagnostics_embed(), ephemeral=True
+            )
+            return
         if choice == "yummy_status":
             state = await read_state_copy()
             poll = (state.get("meta") or {}).get("yummy_poll")
@@ -6121,8 +6103,8 @@ async def adminpanel(interaction: discord.Interaction) -> None:
         title="Админ-панель",
         description=(
             "Меню слева — быстрые действия.\n"
-            "Ещё: **`/admin refresh_help_thread`**, **`/admin personal_rebuild`**, "
-            "**`/admin yummy_resync`**, **`/admin yummy_status`**."
+            "Ещё: **`/admin diagnostics`**, **`/admin refresh_help_thread`**, "
+            "**`/admin personal_rebuild`**, **`/admin yummy_resync`**, **`/admin yummy_status`**."
         ),
         color=EMBED_COLOR,
     )
@@ -6231,37 +6213,6 @@ async def mylist_top(
     )
 
 
-@bot.tree.command(
-    name="settopanime",
-    description="Устар.: используйте /mylist_top",
-)
-@app_commands.describe(
-    slot1="1-е место топа",
-    slot2="2-е место",
-    slot3="3-е место",
-    slot4="4-е место",
-    slot5="5-е место",
-)
-@app_commands.autocomplete(
-    slot1=_personal_slug_autocomplete,
-    slot2=_personal_slug_autocomplete,
-    slot3=_personal_slug_autocomplete,
-    slot4=_personal_slug_autocomplete,
-    slot5=_personal_slug_autocomplete,
-)
-async def settopanime(
-    interaction: discord.Interaction,
-    slot1: str | None = None,
-    slot2: str | None = None,
-    slot3: str | None = None,
-    slot4: str | None = None,
-    slot5: str | None = None,
-) -> None:
-    await _mylist_top_impl(
-        interaction, slot1, slot2, slot3, slot4, slot5
-    )
-
-
 async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
     if not interaction.guild:
         await interaction.response.send_message(
@@ -6320,14 +6271,6 @@ async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
     description="[Мой список] Восстановить панель кнопок в личной теме",
 )
 async def mylist_panel(interaction: discord.Interaction) -> None:
-    await _mylist_panel_impl(interaction)
-
-
-@bot.tree.command(
-    name="mytopicpanel",
-    description="Устар.: используйте /mylist_panel",
-)
-async def mytopicpanel(interaction: discord.Interaction) -> None:
     await _mylist_panel_impl(interaction)
 
 
