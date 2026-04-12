@@ -2,6 +2,7 @@
 Discord-бот: основной форум аниме (/forum_add), личные списки (форум из DISCORD_LIST_FORUM_CHANNEL_ID),
 /mylist_show, MAL (/mal_bind, /mal_import, /mal_show), YummyAnime (/yummy_link, /yummy_sync, …),
 фоновый опрос Yummy, /admin, /adminpanel, /update_topics.
+Состояние: data/mal_state.json или MongoDB (MONGODB_URI) — токены и списки переживают перезапуск.
 Справка: DISCORD_BOT_INFO_THREAD_ID. Токен бота: DISCORD_BOT_TOKEN. Рекомендуется DISCORD_GUILD_ID.
 """
 
@@ -23,6 +24,7 @@ from urllib.parse import quote
 
 import aiohttp
 import discord
+import mongo_store
 import yummy_api
 from aiohttp import web
 from dotenv import load_dotenv
@@ -505,17 +507,7 @@ def _default_yummy_link_state() -> dict[str, Any]:
     return {"pending": {}, "ready": {}}
 
 
-def _load_yummy_link_state_raw() -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not YUMMY_LINK_STATE_PATH.is_file():
-        return _default_yummy_link_state()
-    try:
-        raw = YUMMY_LINK_STATE_PATH.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return _default_yummy_link_state()
-    if not isinstance(data, dict):
-        return _default_yummy_link_state()
+def _normalize_yummy_link_state(data: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("pending", {})
     data.setdefault("ready", {})
     if not isinstance(data["pending"], dict):
@@ -525,7 +517,48 @@ def _load_yummy_link_state_raw() -> dict[str, Any]:
     return data
 
 
+def _load_yummy_link_from_file() -> dict[str, Any] | None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not YUMMY_LINK_STATE_PATH.is_file():
+        return None
+    try:
+        raw = YUMMY_LINK_STATE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _normalize_yummy_link_state(data)
+
+
+def _load_yummy_link_state_raw() -> dict[str, Any]:
+    if mongo_store.mongo_enabled():
+        got = mongo_store.load_json_document(mongo_store.DOC_YUMMY_LINK)
+        if got is not None:
+            return _normalize_yummy_link_state(got)
+        file_data = _load_yummy_link_from_file()
+        if file_data is not None:
+            if mongo_store.save_json_document(mongo_store.DOC_YUMMY_LINK, file_data):
+                logger.info(
+                    "Yummy link state импортирован из %s в MongoDB.",
+                    YUMMY_LINK_STATE_PATH,
+                )
+            return file_data
+        return _default_yummy_link_state()
+    fd = _load_yummy_link_from_file()
+    return fd if fd is not None else _default_yummy_link_state()
+
+
 def _save_yummy_link_state_raw(data: dict[str, Any]) -> None:
+    if mongo_store.mongo_enabled():
+        if not mongo_store.save_json_document(mongo_store.DOC_YUMMY_LINK, data):
+            logger.error("Не удалось записать yummy_link в MongoDB — пробую файл.")
+        if mongo_store.mirror_json_to_file_enabled():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            YUMMY_LINK_STATE_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     YUMMY_LINK_STATE_PATH.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -663,17 +696,7 @@ def _default_state() -> dict[str, Any]:
     }
 
 
-def _load_state() -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not STATE_PATH.is_file():
-        return _default_state()
-    try:
-        raw = STATE_PATH.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return _default_state()
-    if not isinstance(data, dict):
-        return _default_state()
+def _normalize_loaded_state(data: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "mal_accounts",
         "yummy_accounts",
@@ -693,7 +716,48 @@ def _load_state() -> dict[str, Any]:
     return data
 
 
+def _load_state_from_file() -> dict[str, Any] | None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not STATE_PATH.is_file():
+        return None
+    try:
+        raw = STATE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _normalize_loaded_state(data)
+
+
+def _load_state() -> dict[str, Any]:
+    if mongo_store.mongo_enabled():
+        got = mongo_store.load_json_document(mongo_store.DOC_MAIN_STATE)
+        if got is not None:
+            return _normalize_loaded_state(got)
+        file_data = _load_state_from_file()
+        if file_data is not None:
+            if mongo_store.save_json_document(mongo_store.DOC_MAIN_STATE, file_data):
+                logger.info(
+                    "Состояние импортировано из %s в MongoDB (однократная миграция).",
+                    STATE_PATH,
+                )
+            return file_data
+        return _default_state()
+    fd = _load_state_from_file()
+    return fd if fd is not None else _default_state()
+
+
 def _write_state(data: dict[str, Any]) -> None:
+    if mongo_store.mongo_enabled():
+        if not mongo_store.save_json_document(mongo_store.DOC_MAIN_STATE, data):
+            logger.error("Не удалось записать состояние в MongoDB — пробую файл.")
+        if mongo_store.mirror_json_to_file_enabled():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = STATE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(STATE_PATH)
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1373,6 +1437,53 @@ async def sync_forum_threads_with_state(
     except discord.HTTPException as e:
         logger.warning("Архив форума недоступен: %s", e)
     return scanned, updated
+
+
+async def repair_main_forum_threads_batch(
+    client: discord.Client,
+    guild: discord.Guild,
+    session: aiohttp.ClientSession | None,
+    *,
+    archived_limit: int = 100,
+) -> tuple[int, int]:
+    """
+    Обновляет ветки основного форума (реакции, панели, карточка Yummy).
+    Возвращает (успешно, ошибок).
+    """
+    if not session:
+        return 0, 0
+    forum = await resolve_forum_channel(client)
+    if not forum:
+        return 0, 0
+    seen: set[int] = set()
+    ok_n = 0
+    err_n = 0
+
+    async def run(th: discord.Thread) -> None:
+        nonlocal ok_n, err_n
+        if th.id in seen or th.parent_id != forum.id:
+            return
+        seen.add(th.id)
+        try:
+            await repair_single_forum_thread(client, forum, th, session)
+            ok_n += 1
+        except Exception:
+            logger.exception("repair_main_forum_threads_batch %s", th.id)
+            err_n += 1
+
+    for th in forum.threads:
+        await run(th)
+    gt = guild.threads
+    seq = gt.values() if hasattr(gt, "values") else gt
+    for th in seq:
+        if isinstance(th, discord.Thread) and th.parent_id == forum.id:
+            await run(th)
+    try:
+        async for th in forum.archived_threads(limit=archived_limit):
+            await run(th)
+    except discord.HTTPException as e:
+        logger.warning("Архив форума (repair batch): %s", e)
+    return ok_n, err_n
 
 
 def list_discord_added_anime_for_user(
@@ -2296,6 +2407,71 @@ async def _set_personal_list_fields(user_id: int, **fields: Any) -> None:
         _write_state(data)
 
 
+def _is_personal_hub_message(m: discord.Message, bot_user_id: int) -> bool:
+    if m.author.id != bot_user_id or not m.embeds:
+        return False
+    t = (m.embeds[0].title or "").strip()
+    if "🎛️" not in t:
+        return False
+    return "Личный список" in t or "Панель топика" in t
+
+
+async def _dedupe_personal_hub_panel_messages(
+    client: discord.Client,
+    thread: discord.Thread,
+    user_id: int,
+    pl: dict[str, Any],
+) -> None:
+    """Оставляет одну панель управления; лишние сообщения-панели удаляет."""
+    me = client.user
+    if me is None:
+        return
+    hub_ids: list[int] = []
+    try:
+        async for m in thread.history(limit=300):
+            if _is_personal_hub_message(m, me.id):
+                hub_ids.append(m.id)
+    except discord.HTTPException:
+        return
+    if len(hub_ids) == 1:
+        only = hub_ids[0]
+        try:
+            cur_ctrl = int(pl.get("control_message_id") or 0)
+        except (TypeError, ValueError):
+            cur_ctrl = 0
+        if cur_ctrl != only:
+            await _set_personal_list_fields(user_id, control_message_id=only)
+        return
+    if not hub_ids:
+        return
+    ctrl = pl.get("control_message_id")
+    keep: int | None = None
+    if ctrl is not None:
+        try:
+            cid = int(ctrl)
+        except (TypeError, ValueError):
+            cid = 0
+        if cid and cid in hub_ids:
+            keep = cid
+    if keep is None:
+        keep = hub_ids[0]
+    for mid in hub_ids:
+        if mid == keep:
+            continue
+        try:
+            msg = await thread.fetch_message(mid)
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        await asyncio.sleep(0.05)
+    try:
+        cur_ctrl = int(pl.get("control_message_id") or 0)
+    except (TypeError, ValueError):
+        cur_ctrl = 0
+    if cur_ctrl != keep:
+        await _set_personal_list_fields(user_id, control_message_id=keep)
+
+
 async def rebuild_personal_list_display(
     client: discord.Client,
     guild_id: int,
@@ -2332,6 +2508,11 @@ async def rebuild_personal_list_display(
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return
     if not isinstance(thread, discord.Thread):
+        return
+
+    await _dedupe_personal_hub_panel_messages(client, thread, user_id, pl)
+    pl = (await read_state_copy()).get("personal_lists", {}).get(uid_s, pl)
+    if not isinstance(pl, dict):
         return
 
     # миграция: одно старое embed-сообщение
@@ -3837,6 +4018,13 @@ class YummyBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+        if mongo_store.mongo_enabled():
+            if mongo_store.ping():
+                logger.info("Состояние бота: MongoDB (%s).", mongo_store.database_name())
+            else:
+                logger.warning(
+                    "MONGODB_URI задан, но ping не прошёл — проверьте сеть и URI."
+                )
         self.add_view(PersonalTopicHubView())
         self.add_view(AddToMyListPanelView())
         self.add_view(YummyLinkVerifyView())
@@ -4735,16 +4923,26 @@ async def _admin_sync_personal_from_forum(
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
+    sess = bot.session if bot.session else None
+    # 1) Состояние anime_topics/threads из веток основного форума
     scanned, updated = await sync_forum_threads_with_state(
-        bot, interaction.guild, bot.session if bot.session else None
+        bot, interaction.guild, sess
     )
+    # 2) Опционально: реакции, панели и карточки в тех же ветках (MYLIST_ADMIN_SYNC_REPAIR_MAIN_FORUM=1)
+    rep_ok = rep_err = 0
+    _rf = (os.environ.get("MYLIST_ADMIN_SYNC_REPAIR_MAIN_FORUM") or "0").strip().lower()
+    if _rf in ("1", "true", "yes", "on") and sess:
+        rep_ok, rep_err = await repair_main_forum_threads_batch(
+            bot, interaction.guild, sess
+        )
+    # 3) Личный список из обновлённого состояния, затем карточки в личной теме
     n, err = await sync_personal_list_from_anime_topics(interaction.guild, member.id)
     try:
         await ensure_personal_list_thread(
-            bot, interaction.guild, member, session=bot.session
+            bot, interaction.guild, member, session=sess
         )
         await rebuild_personal_list_display(
-            bot, interaction.guild.id, member.id, session=bot.session
+            bot, interaction.guild.id, member.id, session=sess
         )
     except Exception:
         logger.exception("syncanimelist: обновление личной темы")
@@ -4752,6 +4950,12 @@ async def _admin_sync_personal_from_forum(
         f"Основной форум: просмотрено веток **{scanned}**, обновлено записей **{updated}**.",
         f"В личном списке **{member.display_name}**: **{n}** позиций.",
     ]
+    if rep_ok or rep_err:
+        parts.append(
+            f"Ремонт веток основного форума: ок **{rep_ok}**"
+            + (f", ошибок **{rep_err}**" if rep_err else "")
+            + "."
+        )
     if err:
         parts.append(str(err))
     await interaction.followup.send("\n".join(parts), ephemeral=True)
@@ -5598,6 +5802,10 @@ async def _mylist_panel_impl(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+    await _dedupe_personal_hub_panel_messages(interaction.client, ch, oid, pl)
+    st_pl = (await read_state_copy()).get("personal_lists", {}).get(str(oid))
+    if isinstance(st_pl, dict):
+        pl = st_pl
     cid = pl.get("control_message_id")
     if cid:
         try:
