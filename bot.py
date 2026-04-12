@@ -1469,7 +1469,7 @@ def _build_bot_commands_embed() -> discord.Embed:
         ("`/mylist_edit` / `/mylist_top`", "Название темы и первый пост; топ-5 на карточках."),
         ("`/mylist_panel`", "Панель кнопок в личной теме (после сбоев)."),
         ("**MAL** `/mal_bind` · `/mal_import` · `/mal_show`", "Привязка, импорт в форум, просмотр списка с сайта."),
-        ("**Yummy** `/yummy_link` · `/yummy_token` · `/yummy_unbind`", "Привязка (веб или токен вручную), отвязка."),
+        ("**Yummy** `/yummy_link` · `/yummy_token` · `/yummy_unbind`", "Привязка (модалка e-mail/пароль, опц. веб, или токен), отвязка."),
         ("`/yummy_sync` · `/yummy_list` · `/yummy_status`", "Импорт в Discord, просмотр списка API, статус привязки."),
         ("**Админ** `/mylist_admin_sync`", "Пересобрать личный список участника из тем основного форума."),
         ("`/admin` …", "`yummy_resync`, `yummy_status`, `forum_scan`, `personal_rebuild`, `repair_topics`."),
@@ -3639,6 +3639,94 @@ def create_yummy_link_web_app(bot: commands.Bot) -> web.Application:
     return app
 
 
+class YummyDiscordLoginModal(discord.ui.Modal, title="Вход YummyAnime"):
+    """Вход через официальный API без своего сайта (если не требуется captcha)."""
+
+    email = discord.ui.TextInput(
+        label="E-mail (логин на YummyAnime)",
+        placeholder="email@example.com",
+        min_length=3,
+        max_length=200,
+        required=True,
+    )
+    password = discord.ui.TextInput(
+        label="Пароль",
+        style=discord.TextStyle.short,
+        placeholder="В Discord поле не скрыто звёздочками",
+        min_length=1,
+        max_length=400,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+        if not app:
+            await interaction.followup.send(
+                "Не задан **YUMMY_APPLICATION_TOKEN**.", ephemeral=True
+            )
+            return
+        if not bot.session:
+            await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
+            return
+        email = self.email.value.strip()
+        password = self.password.value
+        access, err_msg, st = await yummy_api.yani_login(
+            bot.session, app, email, password, None, USER_AGENT
+        )
+        if not access:
+            extra = ""
+            low = (err_msg or "").lower()
+            if st == 420 or "captcha" in low or "hcaptcha" in low or "bruteforce" in low:
+                extra = (
+                    "\n\nСработала защита сайта (captcha / антибрут). Без страницы с captcha можно "
+                    "только **`/yummy_token`** (токен из браузера после входа на yummyani.me)."
+                )
+            detail = err_msg or (f"HTTP {st}" if st else "ошибка сети")
+            await interaction.followup.send(
+                _truncate(f"Вход не удался: {detail}.{extra}", DISCORD_CONTENT_LIMIT),
+                ephemeral=True,
+            )
+            return
+        prof = await yummy_api.yani_get_profile(bot.session, app, access, USER_AGENT)
+        if not prof:
+            await interaction.followup.send(
+                "Токен получен, но профиль не загрузился. Попробуйте `/yummy_token`.",
+                ephemeral=True,
+            )
+            return
+        yid = prof.get("id")
+        if yid is None:
+            await interaction.followup.send("Ответ API без id пользователя.", ephemeral=True)
+            return
+        try:
+            yid_i = int(yid)
+        except (TypeError, ValueError):
+            await interaction.followup.send("Некорректный id в ответе API.", ephemeral=True)
+            return
+        nick = str(prof.get("nickname") or "")
+        await bind_yummy_account(interaction.user.id, access, yid_i, nick)
+        await interaction.followup.send(
+            f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/yummy_sync` или **Yummy ↻**.\n"
+            "_Пароль не сохраняется; на сервере хранится только токен._",
+            ephemeral=True,
+        )
+
+
+class YummyLinkNoWebView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=600)
+
+    @discord.ui.button(
+        label="Ввести e-mail и пароль",
+        style=discord.ButtonStyle.primary,
+    )
+    async def open_modal(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(YummyDiscordLoginModal())
+
+
 class YummyLinkVerifyView(discord.ui.View):
     """Постоянная кнопка: забирает токен из data/yummy_link_state после веб-входа."""
 
@@ -3681,6 +3769,20 @@ class YummyLinkVerifyView(discord.ui.View):
             "_Токен хранится на сервере с ботом._",
             ephemeral=True,
         )
+
+
+class YummyLinkWebPanelView(YummyLinkVerifyView):
+    """Как YummyLinkVerifyView, плюс вход через модалку Discord (без отдельной вкладки браузера)."""
+
+    @discord.ui.button(
+        label="Или войти здесь (e-mail и пароль)",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def discord_login(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(YummyDiscordLoginModal())
 
 
 class YummyBot(commands.Bot):
@@ -4641,7 +4743,7 @@ async def syncanimelist(
 
 @bot.tree.command(
     name="yummy_link",
-    description="[Yummy] Ссылка для входа на сайте — токен привяжется после кнопки в Discord",
+    description="[Yummy] Привязка: модалка e-mail/пароль в Discord и/или ссылка на веб-вход",
 )
 async def yummy_link(interaction: discord.Interaction) -> None:
     app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
@@ -4654,20 +4756,22 @@ async def yummy_link(interaction: discord.Interaction) -> None:
     public = (os.environ.get("YUMMY_LINK_PUBLIC_URL") or "").strip().rstrip("/")
     port = (os.environ.get("YUMMY_LINK_HTTP_PORT") or "").strip()
     if not public or not port:
+        view = YummyLinkNoWebView()
         await interaction.response.send_message(
-            "Веб-вход не настроен: в `.env` укажите **YUMMY_LINK_PUBLIC_URL** (как вас видит интернет, "
-            "например `https://bot.example.com`) и **YUMMY_LINK_HTTP_PORT** (локальный порт, на котором "
-            "бот слушает HTTP; прокси nginx/caddy перенаправляет на него `/yummy-link`).\n\n"
-            "Пока можно привязать аккаунт вручную: **`/yummy_token`** с Bearer из DevTools.",
+            "**Без своего сайта:** нажмите кнопку и введите e-mail и пароль YummyAnime — запрос уходит на "
+            "официальный API. Если появится защита (captcha), сработает только **`/yummy_token`** "
+            "(токен из DevTools после входа на сайт).\n\n"
+            "_Пароль в модальном окне Discord отображается открытым текстом — это ограничение клиента._",
+            view=view,
             ephemeral=True,
         )
         return
     tok = await yummy_link_create_session(interaction.user.id)
     url = f"{public}/yummy-link?token={quote(tok, safe='')}"
-    view = YummyLinkVerifyView()
+    view = YummyLinkWebPanelView()
     await interaction.response.send_message(
-        "1. Откройте ссылку и войдите в аккаунт YummyAnime (как на сайте).\n"
-        f"2. После успешного входа нажмите кнопку ниже.\n\n{url}",
+        "1. Откройте ссылку и войдите на YummyAnime **или** нажмите вторую кнопку и войдите прямо в Discord.\n"
+        f"2. После **веб**-входа нажмите «Завершить привязку…».\n\n{url}",
         view=view,
         ephemeral=True,
     )
