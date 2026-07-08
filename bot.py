@@ -1467,10 +1467,10 @@ async def resolve_forum_channel(
     legacy = _legacy_forum_id()
     if legacy:
         ch = client.get_channel(legacy)
-        if ch is None and client.is_ready():
+        if ch is None:
             try:
                 ch = await client.fetch_channel(legacy)
-            except (discord.NotFound, discord.Forbidden):
+            except (AttributeError, discord.NotFound, discord.Forbidden):
                 return None
         return ch if isinstance(ch, discord.ForumChannel) else None
     if guild_id is not None:
@@ -1493,10 +1493,10 @@ async def resolve_list_forum_channel(
     legacy = _legacy_list_forum_id()
     if legacy:
         ch = client.get_channel(legacy)
-        if ch is None and client.is_ready():
+        if ch is None:
             try:
                 ch = await client.fetch_channel(legacy)
-            except (discord.NotFound, discord.Forbidden):
+            except (AttributeError, discord.NotFound, discord.Forbidden):
                 return None
         return ch if isinstance(ch, discord.ForumChannel) else None
     return None
@@ -1587,42 +1587,16 @@ def _ordered_keys_for_personal(pl: dict[str, Any]) -> list[str]:
 async def apply_personal_list_permissions(
     thread: discord.Thread, guild: discord.Guild, owner_id: int
 ) -> None:
-    """Только владелец списка и бот могут писать в личной теме."""
-    everyone = guild.default_role
-    over_everyone = discord.PermissionOverwrite(
-        send_messages=False,
-        add_reactions=True,
-        read_message_history=True,
-        view_channel=True,
-    )
-    over_owner = discord.PermissionOverwrite(
-        send_messages=True,
-        add_reactions=True,
-        read_message_history=True,
-        view_channel=True,
-    )
-    me = guild.me
-    if me:
-        over_bot = discord.PermissionOverwrite(
-            send_messages=True,
-            manage_messages=True,
-            embed_links=True,
-            attach_files=True,
-            read_message_history=True,
-            view_channel=True,
-        )
-        try:
-            await thread.set_permissions(me, overwrite=over_bot)
-        except discord.HTTPException:
-            pass
-    try:
-        await thread.set_permissions(everyone, overwrite=over_everyone)
-    except discord.HTTPException:
-        pass
+    """
+    Для Thread нет set_permissions: права наследуются от родительского канала.
+    В приватных тредах можно явно добавить владельца.
+    """
     owner = guild.get_member(owner_id)
-    if owner:
+    if owner is None:
+        return
+    if thread.type is discord.ChannelType.private_thread:
         try:
-            await thread.set_permissions(owner, overwrite=over_owner)
+            await thread.add_user(owner)
         except discord.HTTPException:
             pass
 

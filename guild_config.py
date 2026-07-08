@@ -76,10 +76,10 @@ async def resolve_forum_channel(
         guild = client.get_guild(guild_id)
         if guild is not None:
             ch = guild.get_channel(fid)
-    if ch is None and client.is_ready():
+    if ch is None:
         try:
             ch = await client.fetch_channel(fid)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except (AttributeError, discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return ch if isinstance(ch, discord.ForumChannel) else None
 
@@ -95,10 +95,10 @@ async def resolve_list_forum_channel(
         guild = client.get_guild(guild_id)
         if guild is not None:
             ch = guild.get_channel(fid)
-    if ch is None and client.is_ready():
+    if ch is None:
         try:
             ch = await client.fetch_channel(fid)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except (AttributeError, discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return ch if isinstance(ch, discord.ForumChannel) else None
 
