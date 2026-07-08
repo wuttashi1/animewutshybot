@@ -13,7 +13,7 @@ import {
   TextInputBuilder,
   TextInputStyle
 } from "discord.js";
-import { fetchAnimeCard, searchYummySlug, slugFromText } from "./catalogApi.js";
+import { AnimeCard, fetchAnimeCard, searchYummySlug, slugFromText } from "./catalogApi.js";
 import { config } from "./config.js";
 import { fetchMalList } from "./malApi.js";
 import {
@@ -313,7 +313,10 @@ async function handleAnimeAdd(interaction: ChatInputCommandInteraction): Promise
   }
   const thread = await ch.threads.create({
     name: card.title.slice(0, 100),
-    message: { content: `${card.title}\n${card.pageUrl}\nДобавил: <@${interaction.user.id}>` }
+    message: {
+      content: `Добавил: <@${interaction.user.id}>`,
+      embeds: [buildAnimeEmbed(card, `Добавил: <@${interaction.user.id}>`)]
+    }
   });
   await saveAnimeTopic(card.slug, {
     threadId: thread.id,
@@ -393,7 +396,10 @@ async function handleMalImport(interaction: ChatInputCommandInteraction): Promis
     try {
       const thread = await forum.threads.create({
         name: item.title.slice(0, 100),
-        message: { content: `${item.title}\n${pageUrl}\nИмпорт MAL: <@${interaction.user.id}>` }
+        message: {
+          content: `Импорт MAL: <@${interaction.user.id}>`,
+          embeds: [buildMinimalAnimeEmbed(item.title, pageUrl, "Импортировано из MyAnimeList")]
+        }
       });
       created += 1;
       await saveAnimeTopic(key, {
@@ -473,7 +479,10 @@ async function handleYummySync(interaction: ChatInputCommandInteraction, targetU
     }
     const thread = await channel.threads.create({
       name: title.slice(0, 100),
-      message: { content: `${title}\n${pageUrl}\nИмпорт Yummy: <@${targetUserId}>` }
+      message: {
+        content: `Импорт Yummy: <@${targetUserId}>`,
+        embeds: [buildMinimalAnimeEmbed(title, pageUrl, "Импортировано из Yummy списка")]
+      }
     });
     created += 1;
     await saveAnimeTopic(slug, {
@@ -603,7 +612,10 @@ async function handleAdminPanel(interaction: ChatInputCommandInteraction): Promi
       const pageUrl = `https://en.yummyani.me/catalog/item/${slug}`;
       const thread = await channel.threads.create({
         name: title.slice(0, 100),
-        message: { content: `${title}\n${pageUrl}\nИмпорт админом для: <@${target.id}>` }
+        message: {
+          content: `Импорт админом для: <@${target.id}>`,
+          embeds: [buildMinimalAnimeEmbed(title, pageUrl, "Импорт админом")]
+        }
       });
       created += 1;
       await saveAnimeTopic(slug, {
@@ -663,6 +675,40 @@ async function setupGuildChannels(guild: Guild): Promise<{ cfg: GuildConfig; tex
     cfg,
     text: `Готово.\nКаталог: <#${forum.id}>\nЛичные: <#${listForum.id}>\nСправка: <#${info.id}>`
   };
+}
+
+function buildAnimeEmbed(card: AnimeCard, footer: string): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setTitle(card.title)
+    .setURL(card.pageUrl)
+    .setColor(0x2f6feb)
+    .setDescription(card.description ? truncate(card.description, 700) : "Описание отсутствует.");
+  const fields = [
+    { name: "Тип", value: card.typeName, inline: true },
+    { name: "Статус", value: card.statusTitle, inline: true },
+    { name: "Год", value: card.year, inline: true },
+    { name: "Эпизоды", value: card.episodesLabel, inline: true },
+    { name: "Рейтинг", value: card.ratingAvg, inline: true },
+    { name: "Жанры", value: card.genres.length ? card.genres.join(", ") : "—", inline: false }
+  ];
+  embed.addFields(fields);
+  if (card.posterUrl) {
+    embed.setImage(card.posterUrl);
+  }
+  embed.setFooter({ text: footer });
+  return embed;
+}
+
+function buildMinimalAnimeEmbed(title: string, pageUrl: string, source: string): EmbedBuilder {
+  return new EmbedBuilder()
+    .setTitle(title)
+    .setURL(pageUrl)
+    .setDescription(source)
+    .setColor(0x5865f2);
+}
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 export async function handleYummyBindModal(modal: {
