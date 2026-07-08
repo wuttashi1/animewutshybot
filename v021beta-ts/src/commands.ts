@@ -10,10 +10,11 @@ import {
   Guild,
   ModalBuilder,
   SlashCommandBuilder,
-  StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
-  ThreadChannel
+  ThreadChannel,
+  UserSelectMenuBuilder,
+  UserSelectMenuInteraction
 } from "discord.js";
 import { AnimeCard, fetchAnimeCard, searchYummySlug, slugFromText } from "./catalogApi.js";
 import { config } from "./config.js";
@@ -747,14 +748,15 @@ async function postTopicPanels(thread: ThreadChannel): Promise<void> {
     .setTitle("📣 Порекомендовать аниме")
     .setDescription("Выберите участника сервера в меню ниже — ему придёт уведомление.")
     .setColor(0x5dade2);
-  const recSelect = new StringSelectMenuBuilder()
+  const recSelect = new UserSelectMenuBuilder()
     .setCustomId(`recommend_pick:${thread.id}`)
     .setPlaceholder("Кому порекомендовать?")
-    .addOptions([{ label: "Скоро будет доступно", value: "stub" }]);
+    .setMinValues(1)
+    .setMaxValues(1);
   await thread
     .send({
       embeds: [recEmbed],
-      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(recSelect)]
+      components: [new ActionRowBuilder<UserSelectMenuBuilder>().addComponents(recSelect)]
     })
     .catch(() => undefined);
 
@@ -833,13 +835,6 @@ export async function handleButtonInteraction(interaction: ButtonInteraction): P
     await interaction.reply({ content: "Добавлено в ваш личный список.", ephemeral: true });
     return;
   }
-  if (interaction.customId.startsWith("recommend_pick:")) {
-    await interaction.reply({
-      content: "Рекомендации будут активированы следующим обновлением TS-версии.",
-      ephemeral: true
-    });
-    return;
-  }
   if (interaction.customId === "admin_status") {
     if (!interaction.guildId) {
       await interaction.reply({ content: "Команда только на сервере.", ephemeral: true });
@@ -900,6 +895,36 @@ export async function handleButtonInteraction(interaction: ButtonInteraction): P
       : "Список пуст.";
     await interaction.reply({ content: text, ephemeral: true });
   }
+}
+
+export async function handleUserSelectInteraction(
+  interaction: UserSelectMenuInteraction
+): Promise<void> {
+  if (!interaction.customId.startsWith("recommend_pick:")) {
+    return;
+  }
+  const pickedUserId = interaction.values[0];
+  if (!pickedUserId) {
+    await interaction.reply({ content: "Пользователь не выбран.", ephemeral: true });
+    return;
+  }
+  const threadId = interaction.customId.split(":")[1] || "";
+  const topic = (await findTopicByThreadId(threadId)) ?? null;
+  const animeTitle = topic?.title || "это аниме";
+  const channel = interaction.channel;
+  if (!channel || channel.type !== ChannelType.PublicThread) {
+    await interaction.reply({ content: "Эта функция работает только в теме форума.", ephemeral: true });
+    return;
+  }
+
+  await channel.send({
+    content: `<@${pickedUserId}>, тебе рекомендуют **${animeTitle}** 🍿\nРекомендовал: <@${interaction.user.id}>`,
+    allowedMentions: { users: [pickedUserId, interaction.user.id] }
+  });
+  await interaction.reply({
+    content: `Отправил рекомендацию пользователю <@${pickedUserId}> в эту ветку.`,
+    ephemeral: true
+  });
 }
 
 export async function handleRateModal(modal: {

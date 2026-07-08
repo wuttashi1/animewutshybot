@@ -12,6 +12,7 @@ import { config } from "./config.js";
 import {
   handleButtonInteraction,
   handleChatInput,
+  handleUserSelectInteraction,
   handleRateModal,
   handleYummyBindModal,
   slashCommands
@@ -52,6 +53,10 @@ async function main(): Promise<void> {
       }
       if (interaction.isButton()) {
         await handleButtonInteraction(interaction as ButtonInteraction);
+        return;
+      }
+      if (interaction.isUserSelectMenu()) {
+        await handleUserSelectInteraction(interaction);
         return;
       }
       if (interaction.isModalSubmit() && interaction.customId === "yummy_bind_modal") {
