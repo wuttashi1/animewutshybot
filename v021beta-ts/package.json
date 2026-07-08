@@ -1,0 +1,21 @@
+{
+  "name": "ytwutshybot-v021beta",
+  "version": "0.2.1-beta",
+  "private": true,
+  "description": "YTWUTSHYBOT rewrite beta in TypeScript",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.13",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
