@@ -548,25 +548,10 @@ def setup(bot_instance: discord.Client) -> None:
         assert embed is not None
         await interaction.followup.send(embed=embed)
 
-    # --- yummy ---
-    yummy_group = app_commands.Group(name="yummy", description="YummyAnime: привязка и синхронизация")
-
-    @yummy_group.command(
-        name="bind",
-        description="Привязать YummyAnime: Bearer или логин+пароль",
-    )
-    @app_commands.describe(
-        bearer_token="Authorization: Bearer … из DevTools (необязательно)",
-        login="Логин/почта YummyAnime (если без Bearer)",
-        password="Пароль YummyAnime (если без Bearer)",
-    )
-    async def yummy_bind(
+    async def _bind_yummy_with_token(
         interaction: discord.Interaction,
-        bearer_token: str | None = None,
-        login: str | None = None,
-        password: str | None = None,
+        access_token: str,
     ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
         if not app:
             await interaction.followup.send(
@@ -580,27 +565,9 @@ def setup(bot_instance: discord.Client) -> None:
             logger.exception("HTTP session (yummy bind)")
             await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
             return
-        t = (bearer_token or "").strip()
+        t = (access_token or "").strip()
         if t.lower().startswith("bearer "):
             t = t[7:].strip()
-        if not t:
-            lg = (login or "").strip()
-            pw = (password or "").strip()
-            if not lg or not pw:
-                await interaction.followup.send(
-                    "Укажите либо **bearer_token**, либо пару **login + password**.",
-                    ephemeral=True,
-                )
-                return
-            t, auth_err = await yummy_api.yani_login_password(
-                bind_session, app, lg, pw, core.USER_AGENT
-            )
-            if not t:
-                await interaction.followup.send(
-                    auth_err or "Не удалось выполнить вход в YummyAnime API.",
-                    ephemeral=True,
-                )
-                return
         if len(t) < 12:
             await interaction.followup.send("Получен слишком короткий access token.", ephemeral=True)
             return
@@ -623,10 +590,75 @@ def setup(bot_instance: discord.Client) -> None:
         nick = str(prof.get("nickname") or "")
         await core.bind_yummy_account(interaction.user.id, t, yid_i, nick)
         await interaction.followup.send(
-            f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/yummy sync` "
-            "или кнопка **Yummy ↻** в личной теме.",
+            f"YummyAnime привязан (**{nick or yid_i}**). Импорт: `/yummy sync`.",
             ephemeral=True,
         )
+
+    class YummyBindModal(discord.ui.Modal, title="YummyAnime авторизация"):
+        login = discord.ui.TextInput(
+            label="Логин или почта",
+            placeholder="Введите логин или email",
+            required=True,
+            max_length=100,
+        )
+        password = discord.ui.TextInput(
+            label="Пароль",
+            placeholder="Введите пароль",
+            required=True,
+            style=discord.TextStyle.short,
+            max_length=128,
+        )
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+            if not app:
+                await interaction.response.send_message(
+                    "Владелец бота должен задать **YUMMY_APPLICATION_TOKEN**.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                bind_session = await bot_instance.ensure_http_session()
+            except Exception:
+                logger.exception("HTTP session (yummy bind modal)")
+                await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            token, auth_err = await yummy_api.yani_login_password(
+                bind_session,
+                app,
+                str(self.login.value or "").strip(),
+                str(self.password.value or "").strip(),
+                core.USER_AGENT,
+            )
+            if not token:
+                await interaction.followup.send(
+                    auth_err or "Не удалось выполнить вход в YummyAnime API.",
+                    ephemeral=True,
+                )
+                return
+            await _bind_yummy_with_token(interaction, token)
+
+    # --- yummy ---
+    yummy_group = app_commands.Group(name="yummy", description="YummyAnime: привязка и синхронизация")
+
+    @yummy_group.command(
+        name="bind",
+        description="Привязать аккаунт YummyAnime (через окно входа)",
+    )
+    @app_commands.describe(
+        bearer_token="(опционально) Bearer токен из DevTools, без окна входа",
+    )
+    async def yummy_bind(
+        interaction: discord.Interaction,
+        bearer_token: str | None = None,
+    ) -> None:
+        t = (bearer_token or "").strip()
+        if t:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await _bind_yummy_with_token(interaction, t)
+            return
+        await interaction.response.send_modal(YummyBindModal())
 
     @yummy_group.command(name="unbind", description="Отвязать аккаунт YummyAnime")
     async def yummy_unbind(interaction: discord.Interaction) -> None:
@@ -1462,41 +1494,176 @@ def setup(bot_instance: discord.Client) -> None:
             allowed_mentions=discord.AllowedMentions(users=[target]),
         )
 
-    # --- legacy aliases (старые команды в Discord до синхронизации групп) ---
     @bot_instance.tree.command(
-        name="aa",
-        description="Добавить аниме в форум (алиас /anime add)",
+        name="adminpanel",
+        description="Единая панель админа сервера",
     )
-    @app_commands.describe(query="Ссылка en.yummyani.me или название")
-    async def legacy_aa(interaction: discord.Interaction, query: str) -> None:
-        await _anime_add_impl(interaction, query)
-
-    @bot_instance.tree.command(
-        name="mylist",
-        description="Личный список (алиас /list show)",
+    @app_commands.describe(
+        action="Действие администратора",
+        member="Участник (нужен для sync_list/yummy_sync_member)",
     )
-    @app_commands.describe(member="Чей список (необязательно)")
-    async def legacy_mylist(
-        interaction: discord.Interaction, member: discord.Member | None = None
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="setup_channels", value="setup_channels"),
+            app_commands.Choice(name="status", value="status"),
+            app_commands.Choice(name="forum_scan", value="forum_scan"),
+            app_commands.Choice(name="repair_topics", value="repair_topics"),
+            app_commands.Choice(name="sync_list", value="sync_list"),
+            app_commands.Choice(name="yummy_sync_member", value="yummy_sync_member"),
+            app_commands.Choice(name="roaster_enable", value="roaster_enable"),
+            app_commands.Choice(name="roaster_disable", value="roaster_disable"),
+            app_commands.Choice(name="owner_roaster_on", value="owner_roaster_on"),
+            app_commands.Choice(name="owner_roaster_off", value="owner_roaster_off"),
+        ]
+    )
+    async def adminpanel(
+        interaction: discord.Interaction,
+        action: str,
+        member: discord.Member | None = None,
     ) -> None:
-        await _list_show_impl(interaction, member)
+        if not interaction.guild:
+            await interaction.response.send_message(_GUILD_ONLY_MSG, ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Не удалось определить участника.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Команда доступна только администратору сервера.",
+                ephemeral=True,
+            )
+            return
+        assert interaction.guild is not None
 
-    @bot_instance.tree.command(
-        name="rateanime",
-        description="Оценка в теме форума (алиас /anime rate)",
-    )
-    async def legacy_rateanime(interaction: discord.Interaction) -> None:
-        await _anime_rate_impl(interaction)
+        if action == "status":
+            cfg = await core.get_guild_cfg(interaction.guild.id)
+            await interaction.response.send_message(guild_config.format_guild_status(cfg), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if action == "setup_channels":
+            cfg, err = await guild_config.setup_guild_channels(
+                interaction.guild, commands_embed=core._build_bot_commands_embed()
+            )
+            if err:
+                await interaction.followup.send(err, ephemeral=True)
+                return
+            await core.save_guild_cfg(interaction.guild.id, cfg)
+            await interaction.followup.send(guild_config.format_guild_status(cfg), ephemeral=True)
+            return
+
+        if action == "roaster_enable":
+            cfg = await core.get_guild_cfg(interaction.guild.id) or {}
+            cfg["roaster_enabled"] = True
+            await core.save_guild_cfg(interaction.guild.id, cfg)
+            await interaction.followup.send("Обзыватель включён на сервере.", ephemeral=True)
+            return
+        if action == "roaster_disable":
+            cfg = await core.get_guild_cfg(interaction.guild.id) or {}
+            cfg["roaster_enabled"] = False
+            await core.save_guild_cfg(interaction.guild.id, cfg)
+            await interaction.followup.send("Обзыватель выключен на сервере.", ephemeral=True)
+            return
+        if action == "owner_roaster_on":
+            if not core.is_bot_owner(interaction.user):
+                await interaction.followup.send("Только владелец бота.", ephemeral=True)
+                return
+            async with core._state_lock:
+                data = core._load_state()
+                data.setdefault("meta", {})["roaster_global_enabled"] = True
+                core._write_state(data)
+            await interaction.followup.send("Глобальный обзыватель включён.", ephemeral=True)
+            return
+        if action == "owner_roaster_off":
+            if not core.is_bot_owner(interaction.user):
+                await interaction.followup.send("Только владелец бота.", ephemeral=True)
+                return
+            async with core._state_lock:
+                data = core._load_state()
+                data.setdefault("meta", {})["roaster_global_enabled"] = False
+                core._write_state(data)
+            await interaction.followup.send("Глобальный обзыватель выключен.", ephemeral=True)
+            return
+
+        try:
+            admin_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (adminpanel)")
+            await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
+            return
+
+        if action == "forum_scan":
+            scanned, updated = await core.sync_forum_threads_with_state(
+                bot_instance, interaction.guild, admin_session
+            )
+            await interaction.followup.send(
+                f"Скан: веток **{scanned}**, обновлено записей **{updated}**.",
+                ephemeral=True,
+            )
+            return
+        if action == "repair_topics":
+            forum = await core.resolve_forum_channel(bot_instance, interaction.guild.id)
+            if not forum:
+                await interaction.followup.send("Канал форума не найден.", ephemeral=True)
+                return
+            seen: set[int] = set()
+            ok_n = err_n = 0
+            for th in list(forum.threads):
+                if th.id in seen or th.parent_id != forum.id:
+                    continue
+                seen.add(th.id)
+                try:
+                    await core.repair_single_forum_thread(bot_instance, forum, th, admin_session)
+                    ok_n += 1
+                except Exception:
+                    err_n += 1
+            await interaction.followup.send(
+                f"Готово. Веток: **{len(seen)}**, успешно **{ok_n}**, ошибок **{err_n}**.",
+                ephemeral=True,
+            )
+            return
+        if action == "sync_list":
+            if not member:
+                await interaction.followup.send("Укажите участника через `member`.", ephemeral=True)
+                return
+            scanned, updated = await core.sync_forum_threads_with_state(
+                bot_instance, interaction.guild, admin_session
+            )
+            n, sync_err = await core.sync_personal_list_from_anime_topics(interaction.guild, member.id)
+            await interaction.followup.send(
+                f"Форум: **{scanned}/{updated}**, список {member.display_name}: **{n}**."
+                + (f"\n{sync_err}" if sync_err else ""),
+                ephemeral=True,
+            )
+            return
+        if action == "yummy_sync_member":
+            if not member:
+                await interaction.followup.send("Укажите участника через `member`.", ephemeral=True)
+                return
+            app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
+            if not app:
+                await interaction.followup.send("Нет **YUMMY_APPLICATION_TOKEN**.", ephemeral=True)
+                return
+            r = await core.run_yummy_list_import_for_member(
+                interaction.guild,
+                member.id,
+                list_filter="all",
+                max_topics=10,
+                session=admin_session,
+                app_token=app,
+            )
+            if r.get("error"):
+                await interaction.followup.send(str(r["error"]), ephemeral=True)
+                return
+            await interaction.followup.send(
+                f"{member.display_name}: новых **{r.get('n_new', 0)}**, дописано **{r.get('merge_ops', 0)}**.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("Неизвестное действие.", ephemeral=True)
 
     # --- register all groups ---
-    for grp in (
-        anime_group,
-        mal_group,
-        yummy_group,
-        list_group,
-        admin_group,
-        bot_group,
-        owner_group,
-        roast_group,
-    ):
+    for grp in (anime_group, mal_group, yummy_group, list_group):
         bot_instance.tree.add_command(grp)
