@@ -7,16 +7,19 @@ This is a new beta branch of the bot migrated from Python to TypeScript (`discor
 - New TypeScript runtime (`discord.js` + `ts-node/tsx`)
 - Slash command registration scoped to one guild
 - `/ping`
-- `/anime add` (+ beta placeholder `/anime rate`)
+- `/anime add`, `/anime rate`
 - `/list show`
-- `/mal bind` + beta placeholder `/mal import`
+- `/mal bind`, `/mal import`
 - `/yummy bind|unbind|sync`
 - `/adminpanel` actions:
   - `setup_channels`
   - `status`
-  - `forum_scan` (beta)
-  - `sync_list` (beta)
-- JSON state storage for Yummy bindings in `data/v021beta-state.json`
+  - `forum_scan`
+  - `repair_topics`
+  - `sync_list`
+  - `personal_rebuild`
+  - `yummy_sync_member`
+- JSON state storage for guild config, topics, ratings, personal lists and bindings in `data/v021beta-state.json`
 
 ## Environment
 
@@ -37,4 +40,4 @@ npm run dev
 
 ## Notes
 
-This is a migration baseline. Legacy Python features (forum automation, MAL sync, roaster automation, etc.) should be moved module-by-module on top of this beta.
+This beta now includes the core user/admin command surface on TypeScript. Remaining parity work is mainly advanced UI panels, deeper thread metadata maintenance, and background automation loops.

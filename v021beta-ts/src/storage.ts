@@ -39,6 +39,7 @@ type State = {
   animeTopics: Record<string, AnimeTopic>;
   personalLists: Record<string, PersonalListItem[]>;
   malBindings: Record<string, { username: string; listUrl: string; updatedAt: string }>;
+  ratings: Record<string, Record<string, number>>;
 };
 
 const STATE_PATH = "data/v021beta-state.json";
@@ -49,7 +50,8 @@ function defaultState(): State {
     guilds: {},
     animeTopics: {},
     personalLists: {},
-    malBindings: {}
+    malBindings: {},
+    ratings: {}
   };
 }
 
@@ -69,7 +71,8 @@ export async function loadState(): Promise<State> {
       guilds: parsed.guilds ?? {},
       animeTopics: parsed.animeTopics ?? {},
       personalLists: parsed.personalLists ?? {},
-      malBindings: parsed.malBindings ?? {}
+      malBindings: parsed.malBindings ?? {},
+      ratings: parsed.ratings ?? {}
     };
   } catch {
     return defaultState();
@@ -145,4 +148,45 @@ export async function saveMalBinding(
     updatedAt: new Date().toISOString()
   };
   await saveState(state);
+}
+
+export async function getMalBinding(
+  userId: string
+): Promise<{ username: string; listUrl: string; updatedAt: string } | null> {
+  const state = await loadState();
+  return state.malBindings[userId] ?? null;
+}
+
+export async function rateAnimeTopic(threadId: string, userId: string, score: number): Promise<void> {
+  const state = await loadState();
+  const byUser = state.ratings[threadId] ?? {};
+  byUser[userId] = score;
+  state.ratings[threadId] = byUser;
+  await saveState(state);
+}
+
+export async function getAnimeTopicRatings(
+  threadId: string
+): Promise<{ count: number; average: number | null; byUser: Record<string, number> }> {
+  const state = await loadState();
+  const byUser = state.ratings[threadId] ?? {};
+  const values = Object.values(byUser);
+  if (!values.length) {
+    return { count: 0, average: null, byUser };
+  }
+  const sum = values.reduce((acc, x) => acc + x, 0);
+  return { count: values.length, average: sum / values.length, byUser };
+}
+
+export async function syncPersonalListFromTopics(userId: string): Promise<number> {
+  const state = await loadState();
+  const items = Object.entries(state.animeTopics).map(([slug, topic]) => ({
+    key: slug,
+    title: topic.title,
+    url: topic.pageUrl,
+    addedAt: new Date().toISOString()
+  }));
+  state.personalLists[userId] = items.slice(0, 300);
+  await saveState(state);
+  return state.personalLists[userId].length;
 }
