@@ -81,7 +81,38 @@ export async function loadState(): Promise<State> {
 
 export async function saveState(state: State): Promise<void> {
   await ensureParent(STATE_PATH);
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+  const legacyCompatible = {
+    ...state,
+    yummy_accounts: Object.fromEntries(
+      Object.entries(state.yummyBindings).map(([uid, b]) => [
+        uid,
+        { token: b.accessToken, user_id: b.yummyUserId, nickname: b.nickname, updated_at: b.updatedAt }
+      ])
+    ),
+    mal_accounts: state.malBindings,
+    anime_topics: Object.fromEntries(
+      Object.entries(state.animeTopics).map(([k, v]) => [
+        k,
+        {
+          thread_id: Number(v.threadId),
+          page_url: v.pageUrl,
+          yummy_slug: v.yummySlug,
+          adders: v.adders.map((x) => Number(x) || x),
+          title: v.title
+        }
+      ])
+    ),
+    personal_lists: Object.fromEntries(
+      Object.entries(state.personalLists).map(([uid, list]) => [
+        uid,
+        {
+          order: list.map((x) => x.key),
+          recent_keys: list.map((x) => x.key)
+        }
+      ])
+    )
+  };
+  await writeFile(STATE_PATH, JSON.stringify(legacyCompatible, null, 2), "utf-8");
 }
 
 export async function saveYummyBinding(binding: YummyBinding): Promise<void> {

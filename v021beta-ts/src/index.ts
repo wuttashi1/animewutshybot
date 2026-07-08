@@ -1,4 +1,5 @@
 import {
+  ButtonInteraction,
   Client,
   Events,
   GatewayIntentBits,
@@ -6,8 +7,9 @@ import {
   REST,
   Routes
 } from "discord.js";
+import { startBackgroundLoops } from "./background.js";
 import { config } from "./config.js";
-import { handleChatInput, handleYummyBindModal, slashCommands } from "./commands.js";
+import { handleButtonInteraction, handleChatInput, handleYummyBindModal, slashCommands } from "./commands.js";
 
 async function registerCommands(applicationId: string): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(config.botToken);
@@ -33,12 +35,17 @@ async function main(): Promise<void> {
 
   client.once(Events.ClientReady, (readyClient) => {
     console.log(`YTWUTSHYBOT v0.2.1BETA online as ${readyClient.user.tag}`);
+    startBackgroundLoops(client);
   });
 
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     try {
       if (interaction.isChatInputCommand()) {
         await handleChatInput(interaction);
+        return;
+      }
+      if (interaction.isButton()) {
+        await handleButtonInteraction(interaction as ButtonInteraction);
         return;
       }
       if (interaction.isModalSubmit() && interaction.customId === "yummy_bind_modal") {

@@ -1,5 +1,8 @@
 import {
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonInteraction,
+  ButtonStyle,
   ChannelType,
   ChatInputCommandInteraction,
   EmbedBuilder,
@@ -185,7 +188,17 @@ export async function handleChatInput(interaction: ChatInputCommandInteraction):
     const embed = new EmbedBuilder()
       .setTitle(`Личный список — ${interaction.user.displayName}`)
       .setDescription(items.slice(0, 40).map((x) => `• [${x.title}](${x.url})`).join("\n"));
-    await interaction.reply({ embeds: [embed], ephemeral: true });
+    const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`personal_refresh:${interaction.user.id}`)
+        .setLabel("Обновить")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`personal_compact:${interaction.user.id}`)
+        .setLabel("Компакт")
+        .setStyle(ButtonStyle.Secondary)
+    );
+    await interaction.reply({ embeds: [embed], components: [controls], ephemeral: true });
     return;
   }
 
@@ -500,8 +513,13 @@ async function handleAdminPanel(interaction: ChatInputCommandInteraction): Promi
   }
   if (action === "status") {
     const cfg = await getGuildConfig(interaction.guild.id);
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("admin_status").setLabel("Статус").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("admin_setup").setLabel("Setup").setStyle(ButtonStyle.Primary)
+    );
     await interaction.reply({
       content: cfg ? `Каталог: <#${cfg.forumChannelId}>\nЛичные: <#${cfg.listForumChannelId}>` : "Сервер не настроен.",
+      components: [row],
       ephemeral: true
     });
     return;
@@ -671,4 +689,67 @@ export async function handleYummyBindModal(modal: {
     updatedAt: new Date().toISOString()
   });
   return `YummyAnime привязан: ${profile.nickname || profile.id}`;
+}
+
+export async function handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
+  if (interaction.customId === "admin_status") {
+    if (!interaction.guildId) {
+      await interaction.reply({ content: "Команда только на сервере.", ephemeral: true });
+      return;
+    }
+    const cfg = await getGuildConfig(interaction.guildId);
+    await interaction.reply({
+      content: cfg
+        ? `Каталог: <#${cfg.forumChannelId}>\nЛичные: <#${cfg.listForumChannelId}>`
+        : "Сервер не настроен.",
+      ephemeral: true
+    });
+    return;
+  }
+  if (interaction.customId === "admin_setup") {
+    if (!interaction.guild) {
+      await interaction.reply({ content: "Команда только на сервере.", ephemeral: true });
+      return;
+    }
+    if (!interaction.memberPermissions?.has("Administrator")) {
+      await interaction.reply({ content: "Нужны права администратора.", ephemeral: true });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const out = await setupGuildChannels(interaction.guild);
+    await saveGuildConfig(interaction.guild.id, out.cfg);
+    await interaction.editReply(out.text);
+    return;
+  }
+  if (interaction.customId.startsWith("personal_refresh:")) {
+    const ownerId = interaction.customId.split(":")[1] || "";
+    if (ownerId !== interaction.user.id) {
+      await interaction.reply({ content: "Кнопка не для вас.", ephemeral: true });
+      return;
+    }
+    const items = await getPersonalList(ownerId);
+    const text = items.length
+      ? items
+          .slice(0, 20)
+          .map((x) => `• [${x.title}](${x.url})`)
+          .join("\n")
+      : "Список пуст.";
+    await interaction.reply({ content: text, ephemeral: true });
+    return;
+  }
+  if (interaction.customId.startsWith("personal_compact:")) {
+    const ownerId = interaction.customId.split(":")[1] || "";
+    if (ownerId !== interaction.user.id) {
+      await interaction.reply({ content: "Кнопка не для вас.", ephemeral: true });
+      return;
+    }
+    const items = await getPersonalList(ownerId);
+    const text = items.length
+      ? items
+          .slice(0, 25)
+          .map((x, i) => `${i + 1}. ${x.title}`)
+          .join("\n")
+      : "Список пуст.";
+    await interaction.reply({ content: text, ephemeral: true });
+  }
 }
