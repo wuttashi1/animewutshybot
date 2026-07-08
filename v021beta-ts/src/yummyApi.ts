@@ -50,12 +50,29 @@ function extractToken(payload: unknown): string | null {
   return null;
 }
 
+function extractTokenFromHeaders(headers: Headers): string | null {
+  const rawAuth = headers.get("authorization") || headers.get("Authorization");
+  if (rawAuth) {
+    const s = rawAuth.trim();
+    if (s.toLowerCase().startsWith("bearer ")) {
+      return s.slice(7).trim() || null;
+    }
+    if (s) return s;
+  }
+  for (const key of ["x-token", "x-access-token", "set-authorization"]) {
+    const v = headers.get(key);
+    if (v && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 export async function loginYummyByPassword(params: {
   login: string;
   password: string;
   appToken: string;
   userAgent: string;
 }): Promise<string> {
+  const tried: string[] = [];
   const response = await fetch("https://api.yani.tv/profile/login", {
     method: "POST",
     headers: buildHeaders(params.appToken, params.userAgent),
@@ -80,9 +97,40 @@ export async function loginYummyByPassword(params: {
     throw new Error(`API YummyAnime login failed (HTTP ${response.status}).`);
   }
 
-  const token = extractToken(payload);
+  const token =
+    extractToken(payload) ||
+    extractTokenFromHeaders(response.headers);
   if (!token) {
-    throw new Error("API вернул успешный ответ, но без токена.");
+    const setCookie = response.headers.get("set-cookie");
+    const cookieHeader = setCookie ? setCookie.split(";")[0] : "";
+    if (cookieHeader) {
+      // Fallback path: some backends return session cookie, token is resolved by secondary API call.
+      for (const endpoint of ["https://api.yani.tv/users/token", "https://api.yani.tv/profile/token"]) {
+        tried.push(endpoint);
+        const fallbackResp = await fetch(endpoint, {
+          method: "GET",
+          headers: {
+            ...buildHeaders(params.appToken, params.userAgent),
+            Cookie: cookieHeader
+          }
+        });
+        const fallbackText = await fallbackResp.text();
+        let fallbackPayload: unknown = null;
+        try {
+          fallbackPayload = JSON.parse(fallbackText);
+        } catch {
+          fallbackPayload = null;
+        }
+        const fallbackToken =
+          extractToken(fallbackPayload) ||
+          extractTokenFromHeaders(fallbackResp.headers);
+        if (fallbackToken) {
+          return fallbackToken;
+        }
+      }
+    }
+    const triedText = tried.length ? ` (fallback: ${tried.join(", ")})` : "";
+    throw new Error(`API вернул успешный ответ, но без токена${triedText}.`);
   }
   return token;
 }
