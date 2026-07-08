@@ -106,7 +106,8 @@ async def yani_login_password(
         return None, "Пустой логин или пароль."
 
     headers = build_yani_headers(app_token, None, user_agent)
-    endpoints = ("/auth/login", "/login", "/auth/signin")
+    # Согласно swagger api.yani.tv, логин выполняется через /profile/login.
+    endpoints = ("/profile/login", "/auth/login", "/login", "/auth/signin")
     payloads = (
         {"login": lg, "password": pw},
         {"username": lg, "password": pw},
@@ -143,6 +144,8 @@ async def yani_login_password(
 
     if saw_401 or saw_422:
         return None, "Неверный логин или пароль."
+    if saw_http == {404}:
+        return None, "Login endpoint API не найден. Проверьте базовый URL API."
     if saw_http:
         return None, f"Не удалось авторизоваться в API YummyAnime (HTTP {sorted(saw_http)[0]})."
     return None, "API YummyAnime login endpoint недоступен."
