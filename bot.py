@@ -24,6 +24,7 @@ import discord
 import guild_config
 import personal_display
 import roaster
+import roaster_automation
 import yummy_api
 from dotenv import load_dotenv
 from discord import app_commands
@@ -1329,7 +1330,7 @@ def _build_bot_commands_embed() -> discord.Embed:
         ("**`/admin`**", "скан форума, синк Yummy, ремонт тем, **`roaster_enable`**"),
         ("**`/bot`**", "`setup` · `status`"),
         ("**`/owner`**", "`on` / `off` — глобальный «Обзыватель» (@wutshy)"),
-        ("**`/roast`**", "Сатирическая шутка про аниме-вкус (если включено)"),
+        ("**`/roast`**", "Сатирическая шутка (и **авто** в чате + раз в 1–6 ч)"),
     ]
     for name, desc in rows:
         e.add_field(name=name, value=desc, inline=False)
@@ -3528,6 +3529,7 @@ class YummyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.session: aiohttp.ClientSession | None = None
         self._yummy_poll_task: asyncio.Task[None] | None = None
+        self._roaster_poll_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
@@ -3758,6 +3760,11 @@ async def on_ready() -> None:
     t = bot._yummy_poll_task
     if t is None or t.done():
         bot._yummy_poll_task = asyncio.create_task(yummy_background_poll_loop())
+    rt = bot._roaster_poll_task
+    if rt is None or rt.done():
+        bot._roaster_poll_task = asyncio.create_task(
+            roaster_automation.roaster_background_loop(bot)
+        )
 
 
 @bot.event
@@ -3774,6 +3781,10 @@ async def on_message(message: discord.Message) -> None:
     m = TEXT_ANIMEADD_RE.match(raw)
     if not m:
         await bot.process_commands(message)
+        try:
+            await roaster_automation.maybe_roast_on_message(message)
+        except Exception:
+            logger.exception("roaster on_message")
         return
     query = (m.group(1) or "").strip()
     if not query:
@@ -3788,7 +3799,7 @@ async def on_message(message: discord.Message) -> None:
             out = await run_animeadd_for_user(message.guild, message.author.id, query)
         except Exception:
             logger.exception("Текстовый animeadd")
-            out = "Произошла ошибка при добавлении. Попробуйте `/animeadd`."
+            out = "Произошла ошибка при добавлении. Попробуйте `/anime add`."
     await message.reply(_truncate(out, DISCORD_CONTENT_LIMIT), mention_author=False)
 
 
