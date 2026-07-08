@@ -38,6 +38,7 @@ type State = {
   guilds: Record<string, GuildConfig>;
   animeTopics: Record<string, AnimeTopic>;
   personalLists: Record<string, PersonalListItem[]>;
+  personalThreads: Record<string, string>;
   malBindings: Record<string, { username: string; listUrl: string; updatedAt: string }>;
   ratings: Record<string, Record<string, number>>;
 };
@@ -50,6 +51,7 @@ function defaultState(): State {
     guilds: {},
     animeTopics: {},
     personalLists: {},
+    personalThreads: {},
     malBindings: {},
     ratings: {}
   };
@@ -71,6 +73,7 @@ export async function loadState(): Promise<State> {
       guilds: parsed.guilds ?? {},
       animeTopics: parsed.animeTopics ?? {},
       personalLists: parsed.personalLists ?? {},
+      personalThreads: parsed.personalThreads ?? {},
       malBindings: parsed.malBindings ?? {},
       ratings: parsed.ratings ?? {}
     };
@@ -178,6 +181,25 @@ export async function saveMalBinding(
     listUrl: payload.listUrl,
     updatedAt: new Date().toISOString()
   };
+  await saveState(state);
+}
+
+function personalThreadKey(guildId: string, userId: string): string {
+  return `${guildId}:${userId}`;
+}
+
+export async function getPersonalThreadId(guildId: string, userId: string): Promise<string | null> {
+  const state = await loadState();
+  return state.personalThreads[personalThreadKey(guildId, userId)] ?? null;
+}
+
+export async function savePersonalThreadId(
+  guildId: string,
+  userId: string,
+  threadId: string
+): Promise<void> {
+  const state = await loadState();
+  state.personalThreads[personalThreadKey(guildId, userId)] = threadId;
   await saveState(state);
 }
 

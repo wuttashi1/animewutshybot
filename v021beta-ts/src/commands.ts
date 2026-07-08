@@ -27,12 +27,14 @@ import {
   getGuildConfig,
   getMalBinding,
   getPersonalList,
+  getPersonalThreadId,
   getYummyBinding,
   loadState,
   rateAnimeTopic,
   saveAnimeTopic,
   saveGuildConfig,
   saveMalBinding,
+  savePersonalThreadId,
   saveYummyBinding,
   syncPersonalListFromTopics,
   upsertPersonalListItem
@@ -184,25 +186,14 @@ export async function handleChatInput(interaction: ChatInputCommandInteraction):
   }
 
   if (interaction.commandName === "list" && interaction.options.getSubcommand() === "show") {
-    const items = await getPersonalList(interaction.user.id);
-    if (!items.length) {
-      await interaction.reply({ content: "Ваш список пока пуст.", ephemeral: true });
+    if (!interaction.guild) {
+      await interaction.reply({ content: "Команда только на сервере.", ephemeral: true });
       return;
     }
-    const embed = new EmbedBuilder()
-      .setTitle(`Личный список — ${interaction.user.displayName}`)
-      .setDescription(items.slice(0, 40).map((x) => `• [${x.title}](${x.url})`).join("\n"));
-    const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`personal_refresh:${interaction.user.id}`)
-        .setLabel("Обновить")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`personal_compact:${interaction.user.id}`)
-        .setLabel("Компакт")
-        .setStyle(ButtonStyle.Secondary)
-    );
-    await interaction.reply({ embeds: [embed], components: [controls], ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    const thread = await ensurePersonalListThread(interaction.guild, interaction.user.id, interaction.user.displayName);
+    await renderPersonalListPage(thread, interaction.user.id);
+    await interaction.editReply(`Личная страница готова: ${thread.url}`);
     return;
   }
 
@@ -871,13 +862,11 @@ export async function handleButtonInteraction(interaction: ButtonInteraction): P
       return;
     }
     const items = await getPersonalList(ownerId);
-    const text = items.length
-      ? items
-          .slice(0, 20)
-          .map((x) => `• [${x.title}](${x.url})`)
-          .join("\n")
-      : "Список пуст.";
-    await interaction.reply({ content: text, ephemeral: true });
+    const channel = interaction.channel;
+    if (channel && channel.type === ChannelType.PublicThread) {
+      await renderPersonalListPage(channel, ownerId);
+    }
+    await interaction.reply({ content: "Страница списка обновлена.", ephemeral: true });
     return;
   }
   if (interaction.customId.startsWith("personal_compact:")) {
@@ -894,6 +883,30 @@ export async function handleButtonInteraction(interaction: ButtonInteraction): P
           .join("\n")
       : "Список пуст.";
     await interaction.reply({ content: text, ephemeral: true });
+    return;
+  }
+  if (interaction.customId.startsWith("personal_sync:")) {
+    const ownerId = interaction.customId.split(":")[1] || "";
+    const n = await syncPersonalListFromTopics(ownerId);
+    await interaction.reply({ content: `Синхронизировано позиций: ${n}.`, ephemeral: true });
+    return;
+  }
+  if (interaction.customId.startsWith("personal_stats:")) {
+    const ownerId = interaction.customId.split(":")[1] || "";
+    const items = await getPersonalList(ownerId);
+    await interaction.reply({
+      content: `Статистика списка: записей ${items.length}.`,
+      ephemeral: true
+    });
+    return;
+  }
+  if (interaction.customId.startsWith("personal_help:")) {
+    await interaction.reply({
+      content:
+        "Панель:\n• Обновить — пересобрать карточки.\n• Компакт — краткий вид.\n• Синхронизировать — собрать из тем форума.\n• Статистика — число записей.",
+      ephemeral: true
+    });
+    return;
   }
 }
 
@@ -955,4 +968,75 @@ async function findTopicByThreadId(threadId: string): Promise<{
     }
   }
   return null;
+}
+
+async function ensurePersonalListThread(
+  guild: Guild,
+  userId: string,
+  displayName: string
+): Promise<ThreadChannel> {
+  const cfg = await getGuildConfig(guild.id);
+  const listForumId = cfg?.listForumChannelId;
+  if (!listForumId) {
+    throw new Error("Личный форум не настроен. Запустите /adminpanel setup_channels.");
+  }
+  const parent = await guild.channels.fetch(listForumId);
+  if (!(parent instanceof ForumChannel)) {
+    throw new Error("Канал личных списков недоступен.");
+  }
+  const storedId = await getPersonalThreadId(guild.id, userId);
+  if (storedId) {
+    const existing = await guild.channels.fetch(storedId).catch(() => null);
+    if (existing && existing.type === ChannelType.PublicThread) {
+      return existing;
+    }
+  }
+  const created = await parent.threads.create({
+    name: `${displayName} anime list`.slice(0, 100),
+    message: {
+      content: `<@${userId}> — личный список аниме.`
+    }
+  });
+  await savePersonalThreadId(guild.id, userId, created.id);
+  return created;
+}
+
+async function renderPersonalListPage(thread: ThreadChannel, ownerId: string): Promise<void> {
+  const items = await getPersonalList(ownerId);
+  const panel = new EmbedBuilder()
+    .setTitle("🗂️ Панель топика")
+    .setDescription(
+      `${ownerId} — настройки и действия.\n\n` +
+        "• Синхронизировать — обход основного форума в ваш список.\n" +
+        "• Обновить — перерисовать карточки.\n" +
+        "• Режим — сводка/страницы.\n" +
+        "• Тема — компакт.\n" +
+        "• Yummy — синк.\n" +
+        "• Статистика — справка."
+    )
+    .setColor(0x5dade2);
+  const panelRow1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`personal_refresh:${ownerId}`).setLabel("Обновить").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`personal_compact:${ownerId}`).setLabel("Тема").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`personal_stats:${ownerId}`).setLabel("Статистика").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`personal_help:${ownerId}`).setLabel("Справка").setStyle(ButtonStyle.Secondary)
+  );
+  const panelRow2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`personal_sync:${ownerId}`).setLabel("Синхронизировать").setStyle(ButtonStyle.Success)
+  );
+  await thread.send({ embeds: [panel], components: [panelRow1, panelRow2] }).catch(() => undefined);
+
+  const summary = new EmbedBuilder()
+    .setTitle(`📋 Список — ${ownerId}`)
+    .setDescription(
+      `Всего тайтлов: **${items.length}**\nРежим: Сводка\n\n` +
+        (items.length
+          ? items
+              .slice(0, 20)
+              .map((x, i) => `${i + 1}. [${x.title}](${x.url})`)
+              .join("\n")
+          : "Пока пусто. Добавьте аниме через /anime add.")
+    )
+    .setColor(0x58d68d);
+  await thread.send({ embeds: [summary] }).catch(() => undefined);
 }
