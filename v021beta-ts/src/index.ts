@@ -9,7 +9,13 @@ import {
 } from "discord.js";
 import { startBackgroundLoops } from "./background.js";
 import { config } from "./config.js";
-import { handleButtonInteraction, handleChatInput, handleYummyBindModal, slashCommands } from "./commands.js";
+import {
+  handleButtonInteraction,
+  handleChatInput,
+  handleRateModal,
+  handleYummyBindModal,
+  slashCommands
+} from "./commands.js";
 
 async function registerCommands(applicationId: string): Promise<void> {
   const rest = new REST({ version: "10" }).setToken(config.botToken);
@@ -54,6 +60,17 @@ async function main(): Promise<void> {
           userId: interaction.user.id,
           login: interaction.fields.getTextInputValue("login"),
           password: interaction.fields.getTextInputValue("password")
+        });
+        await interaction.editReply(text);
+        return;
+      }
+      if (interaction.isModalSubmit() && interaction.customId.startsWith("rate_modal:")) {
+        await interaction.deferReply({ ephemeral: true });
+        const threadId = interaction.customId.split(":")[1] || "";
+        const text = await handleRateModal({
+          userId: interaction.user.id,
+          threadId,
+          scoreRaw: interaction.fields.getTextInputValue("score")
         });
         await interaction.editReply(text);
       }

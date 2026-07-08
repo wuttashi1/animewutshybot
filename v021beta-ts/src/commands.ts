@@ -10,8 +10,10 @@ import {
   Guild,
   ModalBuilder,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  ThreadChannel
 } from "discord.js";
 import { AnimeCard, fetchAnimeCard, searchYummySlug, slugFromText } from "./catalogApi.js";
 import { config } from "./config.js";
@@ -25,6 +27,7 @@ import {
   getMalBinding,
   getPersonalList,
   getYummyBinding,
+  loadState,
   rateAnimeTopic,
   saveAnimeTopic,
   saveGuildConfig,
@@ -314,10 +317,11 @@ async function handleAnimeAdd(interaction: ChatInputCommandInteraction): Promise
   const thread = await ch.threads.create({
     name: card.title.slice(0, 100),
     message: {
-      content: `Добавил: <@${interaction.user.id}>`,
-      embeds: [buildAnimeEmbed(card, `Добавил: <@${interaction.user.id}>`)]
+      content: buildTopicHeader(card.pageUrl, interaction.user.id),
+      embeds: [buildAnimeEmbed(card, "YummyAnime · en.yummyani.me")]
     }
   });
+  await postTopicPanels(thread);
   await saveAnimeTopic(card.slug, {
     threadId: thread.id,
     title: card.title,
@@ -397,10 +401,11 @@ async function handleMalImport(interaction: ChatInputCommandInteraction): Promis
       const thread = await forum.threads.create({
         name: item.title.slice(0, 100),
         message: {
-          content: `Импорт MAL: <@${interaction.user.id}>`,
+          content: buildTopicHeader(pageUrl, interaction.user.id),
           embeds: [buildMinimalAnimeEmbed(item.title, pageUrl, "Импортировано из MyAnimeList")]
         }
       });
+      await postTopicPanels(thread);
       created += 1;
       await saveAnimeTopic(key, {
         threadId: thread.id,
@@ -480,10 +485,11 @@ async function handleYummySync(interaction: ChatInputCommandInteraction, targetU
     const thread = await channel.threads.create({
       name: title.slice(0, 100),
       message: {
-        content: `Импорт Yummy: <@${targetUserId}>`,
+        content: buildTopicHeader(pageUrl, targetUserId),
         embeds: [buildMinimalAnimeEmbed(title, pageUrl, "Импортировано из Yummy списка")]
       }
     });
+    await postTopicPanels(thread);
     created += 1;
     await saveAnimeTopic(slug, {
       threadId: thread.id,
@@ -613,10 +619,11 @@ async function handleAdminPanel(interaction: ChatInputCommandInteraction): Promi
       const thread = await channel.threads.create({
         name: title.slice(0, 100),
         message: {
-          content: `Импорт админом для: <@${target.id}>`,
+          content: buildTopicHeader(pageUrl, target.id),
           embeds: [buildMinimalAnimeEmbed(title, pageUrl, "Импорт админом")]
         }
       });
+      await postTopicPanels(thread);
       created += 1;
       await saveAnimeTopic(slug, {
         threadId: thread.id,
@@ -689,7 +696,8 @@ function buildAnimeEmbed(card: AnimeCard, footer: string): EmbedBuilder {
     { name: "Год", value: card.year, inline: true },
     { name: "Эпизоды", value: card.episodesLabel, inline: true },
     { name: "Рейтинг", value: card.ratingAvg, inline: true },
-    { name: "Жанры", value: card.genres.length ? card.genres.join(", ") : "—", inline: false }
+    { name: "Жанры", value: card.genres.length ? card.genres.join(", ") : "—", inline: false },
+    { name: "Ссылка на YummyAnime", value: card.pageUrl, inline: false }
   ];
   embed.addFields(fields);
   if (card.posterUrl) {
@@ -705,6 +713,62 @@ function buildMinimalAnimeEmbed(title: string, pageUrl: string, source: string):
     .setURL(pageUrl)
     .setDescription(source)
     .setColor(0x5865f2);
+}
+
+function buildTopicHeader(pageUrl: string, userId: string): string {
+  return [
+    "Ссылка на YummyAnime",
+    pageUrl,
+    "",
+    "Статус просмотра — нажмите реакцию под этим сообщением:",
+    "👀 смотрю | ✅ просмотрено | 📘 в планах | ⏸️ отложено | ❌ брошено",
+    "",
+    `Добавил: <@${userId}>`
+  ].join("\n");
+}
+
+async function postTopicPanels(thread: ThreadChannel): Promise<void> {
+  const rateEmbed = new EmbedBuilder()
+    .setTitle("⭐ Оценка аниме (1-10)")
+    .setDescription(
+      "Нажмите кнопку **Оценить** и введите целое число от 1 до 10.\n" +
+        "Ниже будет показана средняя оценка участников."
+    )
+    .setColor(0xf5b041);
+  const rateRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`rate_open:${thread.id}`)
+      .setLabel("Оценить")
+      .setStyle(ButtonStyle.Primary)
+  );
+  await thread.send({ embeds: [rateEmbed], components: [rateRow] }).catch(() => undefined);
+
+  const recEmbed = new EmbedBuilder()
+    .setTitle("📣 Порекомендовать аниме")
+    .setDescription("Выберите участника сервера в меню ниже — ему придёт уведомление.")
+    .setColor(0x5dade2);
+  const recSelect = new StringSelectMenuBuilder()
+    .setCustomId(`recommend_pick:${thread.id}`)
+    .setPlaceholder("Кому порекомендовать?")
+    .addOptions([{ label: "Скоро будет доступно", value: "stub" }]);
+  await thread
+    .send({
+      embeds: [recEmbed],
+      components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(recSelect)]
+    })
+    .catch(() => undefined);
+
+  const listEmbed = new EmbedBuilder()
+    .setTitle("🧍 Личный список")
+    .setDescription("Нажмите кнопку, чтобы добавить это аниме в ваш личный список.")
+    .setColor(0x58d68d);
+  const listRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`list_add:${thread.id}`)
+      .setLabel("Добавить в мой список")
+      .setStyle(ButtonStyle.Success)
+  );
+  await thread.send({ embeds: [listEmbed], components: [listRow] }).catch(() => undefined);
 }
 
 function truncate(text: string, max: number): string {
@@ -738,6 +802,44 @@ export async function handleYummyBindModal(modal: {
 }
 
 export async function handleButtonInteraction(interaction: ButtonInteraction): Promise<void> {
+  if (interaction.customId.startsWith("rate_open:")) {
+    const modal = new ModalBuilder()
+      .setCustomId(`rate_modal:${interaction.customId.split(":")[1]}`)
+      .setTitle("Оценить аниме");
+    const scoreInput = new TextInputBuilder()
+      .setCustomId("score")
+      .setLabel("Оценка (1-10)")
+      .setPlaceholder("Введите число от 1 до 10")
+      .setRequired(true)
+      .setStyle(TextInputStyle.Short)
+      .setMaxLength(2);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(scoreInput));
+    await interaction.showModal(modal);
+    return;
+  }
+  if (interaction.customId.startsWith("list_add:")) {
+    const threadId = interaction.customId.split(":")[1] || "";
+    const topic = (await findTopicByThreadId(threadId)) ?? null;
+    if (!topic) {
+      await interaction.reply({ content: "Не удалось определить аниме для этой темы.", ephemeral: true });
+      return;
+    }
+    await upsertPersonalListItem(interaction.user.id, {
+      key: topic.yummySlug || topic.threadId,
+      title: topic.title,
+      url: topic.pageUrl,
+      addedAt: new Date().toISOString()
+    });
+    await interaction.reply({ content: "Добавлено в ваш личный список.", ephemeral: true });
+    return;
+  }
+  if (interaction.customId.startsWith("recommend_pick:")) {
+    await interaction.reply({
+      content: "Рекомендации будут активированы следующим обновлением TS-версии.",
+      ephemeral: true
+    });
+    return;
+  }
   if (interaction.customId === "admin_status") {
     if (!interaction.guildId) {
       await interaction.reply({ content: "Команда только на сервере.", ephemeral: true });
@@ -798,4 +900,34 @@ export async function handleButtonInteraction(interaction: ButtonInteraction): P
       : "Список пуст.";
     await interaction.reply({ content: text, ephemeral: true });
   }
+}
+
+export async function handleRateModal(modal: {
+  userId: string;
+  threadId: string;
+  scoreRaw: string;
+}): Promise<string> {
+  const value = Number.parseInt((modal.scoreRaw || "").trim(), 10);
+  if (!Number.isFinite(value) || value < 1 || value > 10) {
+    throw new Error("Введите целое число от 1 до 10.");
+  }
+  await rateAnimeTopic(modal.threadId, modal.userId, value);
+  const stats = await getAnimeTopicRatings(modal.threadId);
+  return `Оценка сохранена: **${value}**\nСредняя: **${stats.average?.toFixed(2) ?? "—"}** (${stats.count} голосов)`;
+}
+
+async function findTopicByThreadId(threadId: string): Promise<{
+  threadId: string;
+  title: string;
+  pageUrl: string;
+  yummySlug: string;
+} | null> {
+  // Small linear scan is acceptable for beta.
+  const state = await loadState();
+  for (const topic of Object.values(state.animeTopics)) {
+    if (topic.threadId === threadId) {
+      return topic;
+    }
+  }
+  return null;
 }
