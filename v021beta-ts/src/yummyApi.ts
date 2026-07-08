@@ -3,6 +3,19 @@ export type YummyProfile = {
   nickname: string;
 };
 
+export type YummyListEntry = {
+  anime_id?: number;
+  anime_url?: string;
+  title?: string;
+  user?: {
+    list?: {
+      list?: {
+        href?: string;
+      };
+    };
+  };
+};
+
 function buildHeaders(appToken: string, userAgent: string, bearer?: string): HeadersInit {
   const headers: Record<string, string> = {
     "X-Application": appToken,
@@ -92,4 +105,43 @@ export async function getYummyProfile(params: {
     id: Number(profile.id),
     nickname: String(profile.nickname ?? "")
   };
+}
+
+export async function getYummyUserLists(params: {
+  accessToken: string;
+  yummyUserId: number;
+  appToken: string;
+  userAgent: string;
+}): Promise<YummyListEntry[]> {
+  const response = await fetch(`https://api.yani.tv/users/${params.yummyUserId}/lists`, {
+    method: "GET",
+    headers: buildHeaders(params.appToken, params.userAgent, params.accessToken)
+  });
+  const data = (await response.json()) as { response?: unknown };
+  if (!response.ok) {
+    throw new Error(`Не удалось получить списки YummyAnime (HTTP ${response.status}).`);
+  }
+  const items = data.response;
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items as YummyListEntry[];
+}
+
+export function filterYummyEntries(entries: YummyListEntry[], mode: string): YummyListEntry[] {
+  if (mode === "all") {
+    return entries;
+  }
+  const map: Record<string, string> = {
+    watching: "watch_now",
+    plan_to_watch: "will",
+    completed: "watched",
+    on_hold: "postpone",
+    dropped: "lost"
+  };
+  const want = map[mode];
+  if (!want) {
+    return entries;
+  }
+  return entries.filter((entry) => entry.user?.list?.list?.href === want);
 }
