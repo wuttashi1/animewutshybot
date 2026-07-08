@@ -70,9 +70,7 @@ def setup(bot_instance: discord.Client) -> None:
     # --- anime ---
     anime_group = app_commands.Group(name="anime", description="Каталог аниме на основном форуме")
 
-    @anime_group.command(name="add", description="Добавить аниме в основной форум и личный список")
-    @app_commands.describe(query="Ссылка en.yummyani.me или название")
-    async def anime_add(interaction: discord.Interaction, query: str) -> None:
+    async def _anime_add_impl(interaction: discord.Interaction, query: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message(_GUILD_ONLY_MSG, ephemeral=True)
             return
@@ -89,11 +87,12 @@ def setup(bot_instance: discord.Client) -> None:
             core._truncate(out, core.DISCORD_CONTENT_LIMIT), ephemeral=True
         )
 
-    @anime_group.command(
-        name="rate",
-        description="Поставить оценку 1–10 аниме в этой теме форума",
-    )
-    async def anime_rate(interaction: discord.Interaction) -> None:
+    @anime_group.command(name="add", description="Добавить аниме в основной форум и личный список")
+    @app_commands.describe(query="Ссылка en.yummyani.me или название")
+    async def anime_add(interaction: discord.Interaction, query: str) -> None:
+        await _anime_add_impl(interaction, query)
+
+    async def _anime_rate_impl(interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message(_GUILD_ONLY_MSG, ephemeral=True)
             return
@@ -116,6 +115,13 @@ def setup(bot_instance: discord.Client) -> None:
         except Exception as e:
             logger.warning("Панели перед /anime rate: %s", e)
         await interaction.response.send_modal(core.AnimeRatingModal(ch.id))
+
+    @anime_group.command(
+        name="rate",
+        description="Поставить оценку 1–10 аниме в этой теме форума",
+    )
+    async def anime_rate(interaction: discord.Interaction) -> None:
+        await _anime_rate_impl(interaction)
 
     @anime_group.command(
         name="duplicates",
@@ -665,12 +671,7 @@ def setup(bot_instance: discord.Client) -> None:
     # --- list ---
     list_group = app_commands.Group(name="list", description="Личный Discord-список аниме")
 
-    @list_group.command(
-        name="show",
-        description="Личный Discord-список (без полного сканирования форума)",
-    )
-    @app_commands.describe(member="Чей список (если не указано — ваш)")
-    async def list_show(
+    async def _list_show_impl(
         interaction: discord.Interaction, member: discord.Member | None = None
     ) -> None:
         if not interaction.guild:
@@ -699,6 +700,16 @@ def setup(bot_instance: discord.Client) -> None:
             return
         assert embed is not None
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @list_group.command(
+        name="show",
+        description="Личный Discord-список (без полного сканирования форума)",
+    )
+    @app_commands.describe(member="Чей список (если не указано — ваш)")
+    async def list_show(
+        interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        await _list_show_impl(interaction, member)
 
     @list_group.command(
         name="top",
@@ -1409,7 +1420,7 @@ def setup(bot_instance: discord.Client) -> None:
     )
     @app_commands.describe(query="Ссылка en.yummyani.me или название")
     async def legacy_aa(interaction: discord.Interaction, query: str) -> None:
-        await anime_add(interaction, query)
+        await _anime_add_impl(interaction, query)
 
     @bot_instance.tree.command(
         name="animeadd",
@@ -1417,7 +1428,7 @@ def setup(bot_instance: discord.Client) -> None:
     )
     @app_commands.describe(query="Ссылка en.yummyani.me или название")
     async def legacy_animeadd(interaction: discord.Interaction, query: str) -> None:
-        await anime_add(interaction, query)
+        await _anime_add_impl(interaction, query)
 
     @bot_instance.tree.command(
         name="addanime",
@@ -1425,7 +1436,7 @@ def setup(bot_instance: discord.Client) -> None:
     )
     @app_commands.describe(query="Ссылка en.yummyani.me или название")
     async def legacy_addanime(interaction: discord.Interaction, query: str) -> None:
-        await anime_add(interaction, query)
+        await _anime_add_impl(interaction, query)
 
     @bot_instance.tree.command(
         name="mylist",
@@ -1435,7 +1446,7 @@ def setup(bot_instance: discord.Client) -> None:
     async def legacy_mylist(
         interaction: discord.Interaction, member: discord.Member | None = None
     ) -> None:
-        await list_show(interaction, member)
+        await _list_show_impl(interaction, member)
 
     @bot_instance.tree.command(
         name="animelist",
@@ -1445,7 +1456,7 @@ def setup(bot_instance: discord.Client) -> None:
     async def legacy_animelist(
         interaction: discord.Interaction, member: discord.Member | None = None
     ) -> None:
-        await list_show(interaction, member)
+        await _list_show_impl(interaction, member)
 
     @bot_instance.tree.command(
         name="checkanime",
@@ -1455,14 +1466,14 @@ def setup(bot_instance: discord.Client) -> None:
     async def legacy_checkanime(
         interaction: discord.Interaction, member: discord.Member | None = None
     ) -> None:
-        await list_show(interaction, member)
+        await _list_show_impl(interaction, member)
 
     @bot_instance.tree.command(
         name="rateanime",
         description="Оценка в теме форума (алиас /anime rate)",
     )
     async def legacy_rateanime(interaction: discord.Interaction) -> None:
-        await anime_rate(interaction)
+        await _anime_rate_impl(interaction)
 
     # --- register all groups ---
     for grp in (
