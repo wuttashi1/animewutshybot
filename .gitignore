@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 data/mal_state.json
 data/bot.log
+data/health_report.txt

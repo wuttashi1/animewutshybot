@@ -28,6 +28,42 @@ def build_yani_headers(
     return h
 
 
+def _extract_token_from_payload(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("token", "access_token", "accessToken", "jwt"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for key in ("response", "data", "result", "user", "profile"):
+            tok = _extract_token_from_payload(payload.get(key))
+            if tok:
+                return tok
+    elif isinstance(payload, list):
+        for x in payload:
+            tok = _extract_token_from_payload(x)
+            if tok:
+                return tok
+    return None
+
+
+def _extract_token_from_headers(headers: "aiohttp.typedefs.LooseHeaders") -> str | None:
+    if not headers:
+        return None
+    # Некоторые реализации возвращают токен не в JSON, а в заголовках.
+    for key in ("Authorization", "X-Token", "X-Access-Token", "Set-Authorization"):
+        try:
+            v = headers.get(key)  # type: ignore[union-attr]
+        except Exception:
+            v = None
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if s.lower().startswith("bearer "):
+                s = s[7:].strip()
+            if s:
+                return s
+    return None
+
+
 async def _yani_request(
     session: aiohttp.ClientSession,
     method: str,
@@ -69,6 +105,73 @@ async def yani_get_profile(
         return None
     inner = data.get("response")
     return inner if isinstance(inner, dict) else None
+
+
+async def yani_login_password(
+    session: aiohttp.ClientSession,
+    app_token: str,
+    login: str,
+    password: str,
+    user_agent: str,
+) -> tuple[str | None, str | None]:
+    """
+    Авторизация по логину/паролю в API YummyAnime.
+    Возвращает (access_token, err_text).
+    """
+    lg = (login or "").strip()
+    pw = (password or "").strip()
+    if not lg or not pw:
+        return None, "Пустой логин или пароль."
+
+    headers = build_yani_headers(app_token, None, user_agent)
+    payloads = (
+        {"login": lg, "password": pw},
+        {"username": lg, "password": pw},
+        {"email": lg, "password": pw},
+    )
+    saw_401 = False
+    saw_422 = False
+    saw_http: set[int] = set()
+
+    for body in payloads:
+        try:
+            async with session.post(f"{YANI_BASE}/profile/login", headers=headers, json=body) as resp:
+                status = resp.status
+                saw_http.add(status)
+                if status in (401, 403):
+                    saw_401 = True
+                    continue
+                if status == 422:
+                    saw_422 = True
+                    continue
+                try:
+                    data: Any = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    data = None
+                if status in (200, 201):
+                    tok = _extract_token_from_payload(data)
+                    if tok:
+                        return tok, None
+                    tok = _extract_token_from_headers(resp.headers)
+                    if tok:
+                        return tok, None
+                    # fallback: иногда токен приходит cookie'ем
+                    for name in ("token", "access_token", "jwt"):
+                        c = resp.cookies.get(name)
+                        if c and c.value:
+                            return c.value.strip(), None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("YANI login request failed /profile/login: %s", e)
+
+    if saw_401 or saw_422:
+        return None, "Неверный логин или пароль."
+    if saw_http == {404}:
+        return None, "Login endpoint `/profile/login` не найден в API."
+    if 200 in saw_http or 201 in saw_http:
+        return None, "API вернул успешный ответ, но без токена. Проверьте тип аккаунта."
+    if saw_http:
+        return None, f"Не удалось авторизоваться в API YummyAnime (HTTP {sorted(saw_http)[0]})."
+    return None, "API YummyAnime login endpoint недоступен."
 
 
 async def yani_refresh_access_token(
