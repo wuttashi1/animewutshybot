@@ -1402,6 +1402,68 @@ def setup(bot_instance: discord.Client) -> None:
             allowed_mentions=discord.AllowedMentions(users=[target]),
         )
 
+    # --- legacy aliases (старые команды в Discord до синхронизации групп) ---
+    @bot_instance.tree.command(
+        name="aa",
+        description="Добавить аниме в форум (алиас /anime add)",
+    )
+    @app_commands.describe(query="Ссылка en.yummyani.me или название")
+    async def legacy_aa(interaction: discord.Interaction, query: str) -> None:
+        await anime_add(interaction, query)
+
+    @bot_instance.tree.command(
+        name="animeadd",
+        description="Добавить аниме (алиас /anime add)",
+    )
+    @app_commands.describe(query="Ссылка en.yummyani.me или название")
+    async def legacy_animeadd(interaction: discord.Interaction, query: str) -> None:
+        await anime_add(interaction, query)
+
+    @bot_instance.tree.command(
+        name="addanime",
+        description="Добавить аниме (алиас /anime add)",
+    )
+    @app_commands.describe(query="Ссылка en.yummyani.me или название")
+    async def legacy_addanime(interaction: discord.Interaction, query: str) -> None:
+        await anime_add(interaction, query)
+
+    @bot_instance.tree.command(
+        name="mylist",
+        description="Личный список (алиас /list show)",
+    )
+    @app_commands.describe(member="Чей список (необязательно)")
+    async def legacy_mylist(
+        interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        await list_show(interaction, member)
+
+    @bot_instance.tree.command(
+        name="animelist",
+        description="Личный список (алиас /list show)",
+    )
+    @app_commands.describe(member="Чей список (необязательно)")
+    async def legacy_animelist(
+        interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        await list_show(interaction, member)
+
+    @bot_instance.tree.command(
+        name="checkanime",
+        description="Личный список (алиас /list show)",
+    )
+    @app_commands.describe(member="Чей список (необязательно)")
+    async def legacy_checkanime(
+        interaction: discord.Interaction, member: discord.Member | None = None
+    ) -> None:
+        await list_show(interaction, member)
+
+    @bot_instance.tree.command(
+        name="rateanime",
+        description="Оценка в теме форума (алиас /anime rate)",
+    )
+    async def legacy_rateanime(interaction: discord.Interaction) -> None:
+        await anime_rate(interaction)
+
     # --- register all groups ---
     for grp in (
         anime_group,
