@@ -233,7 +233,10 @@ def setup(bot_instance: discord.Client) -> None:
             return
         assert interaction.guild is not None
         await interaction.response.defer(ephemeral=True, thinking=True)
-        if not core.bot.session:
+        try:
+            session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (mal import)")
             await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
             return
 
@@ -273,7 +276,7 @@ def setup(bot_instance: discord.Client) -> None:
 
         status_int = _mal_choice_to_status(mal_status)
         entries, http_st = await core.mal_fetch_full_list(
-            core.bot.session, username, status_int
+            session, username, status_int
         )
         if http_st != 200:
             await interaction.followup.send(
@@ -283,7 +286,7 @@ def setup(bot_instance: discord.Client) -> None:
             )
             return
 
-        forum = await core.resolve_forum_channel(core.bot, interaction.guild.id)
+        forum = await core.resolve_forum_channel(bot_instance, interaction.guild.id)
         if not forum:
             await interaction.followup.send(
                 "Канал форума не найден. Аккаунт MAL сохранён; импорт можно повторить позже.",
@@ -319,13 +322,13 @@ def setup(bot_instance: discord.Client) -> None:
                 continue
 
             query = core.mal_item_title(entry)
-            slug = await core.api_search_slug(core.bot.session, query)
-            info = await core.api_fetch_anime(core.bot.session, slug) if slug else None
+            slug = await core.api_search_slug(session, query)
+            info = await core.api_fetch_anime(session, slug) if slug else None
 
             if info:
                 slug_key = core._clean_slug((info.get("anime_url") or "").strip())
                 thread, mst = await core.merge_adder_into_existing_topic(
-                    core.bot, slug_key, uid
+                    bot_instance, slug_key, uid
                 )
                 if mst == "merged":
                     await core.mark_mal_imported(interaction.user.id, aid)
@@ -382,7 +385,7 @@ def setup(bot_instance: discord.Client) -> None:
 
                 thread, _st, err = await core.create_yummy_forum_thread(
                     forum,
-                    core.bot.session,
+                    session,
                     info,
                     uid,
                     mal_id=aid,
@@ -390,7 +393,7 @@ def setup(bot_instance: discord.Client) -> None:
                 )
             else:
                 thread, mst = await core.merge_adder_into_existing_topic(
-                    core.bot, f"mal:{aid}", uid
+                    bot_instance, f"mal:{aid}", uid
                 )
                 if mst == "merged":
                     await core.mark_mal_imported(interaction.user.id, aid)
@@ -513,7 +516,10 @@ def setup(bot_instance: discord.Client) -> None:
         if not interaction.guild:
             await interaction.response.send_message(_GUILD_ONLY_MSG, ephemeral=True)
             return
-        if not core.bot.session:
+        try:
+            mal_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (mal show)")
             await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
             return
         assert interaction.guild is not None
@@ -531,7 +537,7 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(thinking=True)
         state = await core.read_state_copy()
         embed, err = await core.build_mal_list_embed_for_member(
-            core.bot.session, state, target
+            mal_session, state, target
         )
         if err:
             await interaction.followup.send(err)
@@ -564,10 +570,13 @@ def setup(bot_instance: discord.Client) -> None:
         if len(t) < 12:
             await interaction.followup.send("Токен слишком короткий.", ephemeral=True)
             return
-        if not core.bot.session:
+        try:
+            bind_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (yummy bind)")
             await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
             return
-        prof = await yummy_api.yani_get_profile(core.bot.session, app, t, core.USER_AGENT)
+        prof = await yummy_api.yani_get_profile(bind_session, app, t, core.USER_AGENT)
         if not prof:
             await interaction.followup.send(
                 "Не удалось получить профиль. Проверьте токен.",
@@ -632,7 +641,10 @@ def setup(bot_instance: discord.Client) -> None:
                 "Не задан **YUMMY_APPLICATION_TOKEN** на стороне бота.", ephemeral=True
             )
             return
-        if not core.bot.session:
+        try:
+            yummy_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (yummy import)")
             await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -641,7 +653,7 @@ def setup(bot_instance: discord.Client) -> None:
             interaction.user.id,
             list_filter=yummy_list,
             max_topics=int(max_topics),
-            session=core.bot.session,
+            session=yummy_session,
             app_token=app,
         )
         if r.get("error"):
@@ -767,7 +779,7 @@ def setup(bot_instance: discord.Client) -> None:
                 data["personal_lists"][uid_s] = pl2
                 core._write_state(data)
             await core.rebuild_personal_list_display(
-                core.bot, interaction.guild.id, uid, session=core.bot.session
+                bot_instance, interaction.guild.id, uid, session=bot_instance.session
             )
             await interaction.followup.send(
                 "Топ очищен. Карточки в теме пересобраны.", ephemeral=True
@@ -790,7 +802,7 @@ def setup(bot_instance: discord.Client) -> None:
             data["personal_lists"][uid_s] = pl2
             core._write_state(data)
         await core.rebuild_personal_list_display(
-            core.bot, interaction.guild.id, uid, session=core.bot.session
+            bot_instance, interaction.guild.id, uid, session=bot_instance.session
         )
         await interaction.followup.send(
             f"Топ сохранён (**{len(uniq)}**). Карточки пересобраны.",
@@ -949,7 +961,7 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await core.rebuild_personal_list_display(
-                core.bot, interaction.guild.id, uid, session=core.bot.session
+                bot_instance, interaction.guild.id, uid, session=bot_instance.session
             )
         except Exception:
             logger.exception("list mode rebuild")
@@ -993,7 +1005,10 @@ def setup(bot_instance: discord.Client) -> None:
                 "Нет **YUMMY_APPLICATION_TOKEN**.", ephemeral=True
             )
             return
-        if not core.bot.session:
+        try:
+            admin_yummy_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (admin yummy sync)")
             await interaction.response.send_message(
                 "Сессия HTTP не готова.", ephemeral=True
             )
@@ -1004,7 +1019,7 @@ def setup(bot_instance: discord.Client) -> None:
             member.id,
             list_filter="all",
             max_topics=int(max_topics),
-            session=core.bot.session,
+            session=admin_yummy_session,
             app_token=app,
         )
         if r.get("error"):
@@ -1064,7 +1079,10 @@ def setup(bot_instance: discord.Client) -> None:
         if not ok:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        if not core.bot.session:
+        try:
+            scan_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (admin forum_scan)")
             await interaction.response.send_message(
                 "Сессия HTTP не готова.", ephemeral=True
             )
@@ -1072,7 +1090,7 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         assert interaction.guild is not None
         scanned, updated = await core.sync_forum_threads_with_state(
-            core.bot, interaction.guild, core.bot.session
+            bot_instance, interaction.guild, scan_session
         )
         await interaction.followup.send(
             f"Просмотрено веток: **{scanned}**, обновлено записей: **{updated}**.",
@@ -1095,10 +1113,10 @@ def setup(bot_instance: discord.Client) -> None:
         assert interaction.guild is not None
         try:
             await core.ensure_personal_list_thread(
-                core.bot, interaction.guild, member, session=core.bot.session
+                bot_instance, interaction.guild, member, session=bot_instance.session
             )
             await core.rebuild_personal_list_display(
-                core.bot, interaction.guild.id, member.id, session=core.bot.session
+                bot_instance, interaction.guild.id, member.id, session=bot_instance.session
             )
         except Exception:
             logger.exception("admin personal_rebuild")
@@ -1117,14 +1135,17 @@ def setup(bot_instance: discord.Client) -> None:
         if not ok:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        if not core.bot.session:
+        try:
+            repair_session = await bot_instance.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (admin repair_topics)")
             await interaction.response.send_message(
                 "Сессия HTTP не готова.", ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         assert interaction.guild is not None
-        forum = await core.resolve_forum_channel(core.bot, interaction.guild.id)
+        forum = await core.resolve_forum_channel(bot_instance, interaction.guild.id)
         if not forum:
             await interaction.followup.send("Канал форума не найден.", ephemeral=True)
             return
@@ -1139,7 +1160,7 @@ def setup(bot_instance: discord.Client) -> None:
             seen.add(th.id)
             try:
                 await core.repair_single_forum_thread(
-                    core.bot, forum, th, core.bot.session
+                    bot_instance, forum, th, repair_session
                 )
                 ok_n += 1
             except Exception:
@@ -1181,17 +1202,17 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         assert interaction.guild is not None
         scanned, updated = await core.sync_forum_threads_with_state(
-            core.bot, interaction.guild, core.bot.session if core.bot.session else None
+            bot_instance, interaction.guild, bot_instance.session if bot_instance.session else None
         )
         n, sync_err = await core.sync_personal_list_from_anime_topics(
             interaction.guild, member.id
         )
         try:
             await core.ensure_personal_list_thread(
-                core.bot, interaction.guild, member, session=core.bot.session
+                bot_instance, interaction.guild, member, session=bot_instance.session
             )
             await core.rebuild_personal_list_display(
-                core.bot, interaction.guild.id, member.id, session=core.bot.session
+                bot_instance, interaction.guild.id, member.id, session=bot_instance.session
             )
         except Exception:
             logger.exception("admin sync_list")

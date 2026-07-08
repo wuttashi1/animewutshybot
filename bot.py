@@ -2086,8 +2086,14 @@ class PersonalTopicHubView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        sess = getattr(interaction.client, "session", None)
-        if not sess:
+        client = interaction.client
+        if not isinstance(client, YummyBot):
+            await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
+            return
+        try:
+            sess = await client.ensure_http_session()
+        except Exception:
+            logger.exception("HTTP session (plist hub yummy)")
             await interaction.response.send_message("Сессия HTTP не готова.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -3466,11 +3472,14 @@ class AdminPanelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         assert interaction.guild is not None
         if choice == "forum_scan":
-            if not bot.session:
+            try:
+                scan_session = await bot.ensure_http_session()
+            except Exception:
+                logger.exception("HTTP session (forum_scan)")
                 await interaction.followup.send("Нет HTTP сессии.", ephemeral=True)
                 return
             scanned, updated = await sync_forum_threads_with_state(
-                bot, interaction.guild, bot.session
+                bot, interaction.guild, scan_session
             )
             await interaction.followup.send(
                 f"Скан: веток **{scanned}**, обновлено записей **{updated}**.",
@@ -3478,7 +3487,10 @@ class AdminPanelView(discord.ui.View):
             )
             return
         if choice == "repair_topics":
-            if not bot.session:
+            try:
+                repair_session = await bot.ensure_http_session()
+            except Exception:
+                logger.exception("HTTP session (repair_topics)")
                 await interaction.followup.send("Нет HTTP сессии.", ephemeral=True)
                 return
             forum = await resolve_forum_channel(bot, interaction.guild.id)
@@ -3494,7 +3506,7 @@ class AdminPanelView(discord.ui.View):
                     return
                 seen.add(th.id)
                 try:
-                    await repair_single_forum_thread(bot, forum, th, bot.session)
+                    await repair_single_forum_thread(bot, forum, th, repair_session)
                     ok_n += 1
                 except Exception:
                     logger.exception("adminpanel repair %s", th.id)
@@ -3531,8 +3543,15 @@ class YummyBot(commands.Bot):
         self._yummy_poll_task: asyncio.Task[None] | None = None
         self._roaster_poll_task: asyncio.Task[None] | None = None
 
+    async def ensure_http_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            if self.session is not None and self.session.closed:
+                logger.warning("HTTP-сессия закрыта, пересоздаём")
+            self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+        return self.session
+
     async def setup_hook(self) -> None:
-        self.session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
+        await self.ensure_http_session()
         self.add_view(PersonalTopicHubView())
         self.add_view(AddToMyListPanelView())
         self.add_view(personal_display.PersonalPagerView())
@@ -3602,17 +3621,20 @@ TEXT_ANIMEADD_RE = re.compile(
 
 async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) -> str:
     """Текст ответа для slash или сообщения в чате."""
-    if not bot.session:
+    try:
+        session = await bot.ensure_http_session()
+    except Exception:
+        logger.exception("Не удалось создать HTTP-сессию")
         return "Сессия HTTP не готова."
     q = query.strip()
     if not q:
         return "Пустой запрос."
     slug = slug_from_text(q)
     if not slug:
-        slug = await api_search_slug(bot.session, q)
+        slug = await api_search_slug(session, q)
     if not slug:
         return "Не нашёл аниме. Уточните запрос или вставьте ссылку с en.yummyani.me."
-    info = await api_fetch_anime(bot.session, slug)
+    info = await api_fetch_anime(session, slug)
     if not info:
         return "Не удалось загрузить карточку аниме (API вернул ошибку)."
     ch = await resolve_forum_channel(bot, guild.id)
@@ -3642,7 +3664,7 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
             "(права или тема удалена). Обратитесь к администратору."
         )
     thread, _starter, err = await create_yummy_forum_thread(
-        ch, bot.session, info, user_id, mal_id=None, resolved_slug=slug
+        ch, session, info, user_id, mal_id=None, resolved_slug=slug
     )
     if err or not thread:
         return err or "Не удалось создать тему."
@@ -3818,6 +3840,10 @@ def _normalize_discord_token(raw: str | None) -> str:
 
 
 def main() -> None:
+    # python bot.py загружает файл как __main__; import bot as core иначе даёт второй экземпляр YummyBot без session.
+    if __name__ == "__main__":
+        sys.modules["bot"] = sys.modules[__name__]
+
     load_dotenv()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
