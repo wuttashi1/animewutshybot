@@ -77,6 +77,7 @@ export async function loginYummyByPassword(params: {
     method: "POST",
     headers: buildHeaders(params.appToken, params.userAgent),
     body: JSON.stringify({
+      need_json: true,
       login: params.login,
       password: params.password
     })
