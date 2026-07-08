@@ -78,7 +78,10 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             out = await core.run_animeadd_for_user(
-                interaction.guild, interaction.user.id, query
+                interaction.guild,
+                interaction.user.id,
+                query,
+                client=bot_instance,
             )
         except Exception:
             logger.exception("anime add")
@@ -1444,47 +1447,11 @@ def setup(bot_instance: discord.Client) -> None:
         await _anime_add_impl(interaction, query)
 
     @bot_instance.tree.command(
-        name="animeadd",
-        description="Добавить аниме (алиас /anime add)",
-    )
-    @app_commands.describe(query="Ссылка en.yummyani.me или название")
-    async def legacy_animeadd(interaction: discord.Interaction, query: str) -> None:
-        await _anime_add_impl(interaction, query)
-
-    @bot_instance.tree.command(
-        name="addanime",
-        description="Добавить аниме (алиас /anime add)",
-    )
-    @app_commands.describe(query="Ссылка en.yummyani.me или название")
-    async def legacy_addanime(interaction: discord.Interaction, query: str) -> None:
-        await _anime_add_impl(interaction, query)
-
-    @bot_instance.tree.command(
         name="mylist",
         description="Личный список (алиас /list show)",
     )
     @app_commands.describe(member="Чей список (необязательно)")
     async def legacy_mylist(
-        interaction: discord.Interaction, member: discord.Member | None = None
-    ) -> None:
-        await _list_show_impl(interaction, member)
-
-    @bot_instance.tree.command(
-        name="animelist",
-        description="Личный список (алиас /list show)",
-    )
-    @app_commands.describe(member="Чей список (необязательно)")
-    async def legacy_animelist(
-        interaction: discord.Interaction, member: discord.Member | None = None
-    ) -> None:
-        await _list_show_impl(interaction, member)
-
-    @bot_instance.tree.command(
-        name="checkanime",
-        description="Личный список (алиас /list show)",
-    )
-    @app_commands.describe(member="Чей список (необязательно)")
-    async def legacy_checkanime(
         interaction: discord.Interaction, member: discord.Member | None = None
     ) -> None:
         await _list_show_impl(interaction, member)

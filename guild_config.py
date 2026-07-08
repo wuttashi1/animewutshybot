@@ -71,11 +71,15 @@ async def resolve_forum_channel(
     fid = forum_channel_id(cfg)
     if not fid:
         return None
-    ch = client.get_channel(fid)
+    ch: discord.abc.GuildChannel | None = client.get_channel(fid)
     if ch is None:
+        guild = client.get_guild(guild_id)
+        if guild is not None:
+            ch = guild.get_channel(fid)
+    if ch is None and client.is_ready():
         try:
             ch = await client.fetch_channel(fid)
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return ch if isinstance(ch, discord.ForumChannel) else None
 
@@ -86,11 +90,15 @@ async def resolve_list_forum_channel(
     fid = list_forum_channel_id(cfg)
     if not fid:
         return None
-    ch = client.get_channel(fid)
+    ch: discord.abc.GuildChannel | None = client.get_channel(fid)
     if ch is None:
+        guild = client.get_guild(guild_id)
+        if guild is not None:
+            ch = guild.get_channel(fid)
+    if ch is None and client.is_ready():
         try:
             ch = await client.fetch_channel(fid)
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return ch if isinstance(ch, discord.ForumChannel) else None
 

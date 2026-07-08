@@ -1467,7 +1467,7 @@ async def resolve_forum_channel(
     legacy = _legacy_forum_id()
     if legacy:
         ch = client.get_channel(legacy)
-        if ch is None:
+        if ch is None and client.is_ready():
             try:
                 ch = await client.fetch_channel(legacy)
             except (discord.NotFound, discord.Forbidden):
@@ -1493,7 +1493,7 @@ async def resolve_list_forum_channel(
     legacy = _legacy_list_forum_id()
     if legacy:
         ch = client.get_channel(legacy)
-        if ch is None:
+        if ch is None and client.is_ready():
             try:
                 ch = await client.fetch_channel(legacy)
             except (discord.NotFound, discord.Forbidden):
@@ -3612,6 +3612,9 @@ class YummyBot(commands.Bot):
 
 
 bot = YummyBot()
+# python bot.py → __main__; register_commands делает import bot as core — без алиаса второй YummyBot.
+if __name__ == "__main__":
+    sys.modules["bot"] = sys.modules[__name__]
 
 TEXT_ANIMEADD_RE = re.compile(
     r"^(?:!aa|!animeadd|/aa|/animeadd)\s+(.+)$",
@@ -3619,10 +3622,17 @@ TEXT_ANIMEADD_RE = re.compile(
 )
 
 
-async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) -> str:
+async def run_animeadd_for_user(
+    guild: discord.Guild,
+    user_id: int,
+    query: str,
+    *,
+    client: YummyBot | None = None,
+) -> str:
     """Текст ответа для slash или сообщения в чате."""
+    dc = client or bot
     try:
-        session = await bot.ensure_http_session()
+        session = await dc.ensure_http_session()
     except Exception:
         logger.exception("Не удалось создать HTTP-сессию")
         return "Сессия HTTP не готова."
@@ -3637,11 +3647,11 @@ async def run_animeadd_for_user(guild: discord.Guild, user_id: int, query: str) 
     info = await api_fetch_anime(session, slug)
     if not info:
         return "Не удалось загрузить карточку аниме (API вернул ошибку)."
-    ch = await resolve_forum_channel(bot, guild.id)
+    ch = await resolve_forum_channel(dc, guild.id)
     if not ch:
         return "Канал форума не настроен. Админ сервера: **`/bot setup`**."
     slug_key = _clean_slug((info.get("anime_url") or slug or "").strip())
-    thread, merge_st = await merge_adder_into_existing_topic(bot, slug_key, user_id)
+    thread, merge_st = await merge_adder_into_existing_topic(dc, slug_key, user_id)
     if merge_st == "merged":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
         tname = thread.name[:200] if thread else (info.get("title") or slug_key)
@@ -3774,6 +3784,20 @@ async def on_ready() -> None:
     state = await read_state_copy()
     guilds_cfg = state.get("guilds") or {}
     if isinstance(guilds_cfg, dict):
+        for gid_s, cfg in guilds_cfg.items():
+            if isinstance(cfg, dict):
+                try:
+                    gid = int(gid_s)
+                    mf = await resolve_forum_channel(bot, gid)
+                    lf = await resolve_list_forum_channel(bot, gid)
+                    logger.info(
+                        "Guild %s: каталог=%s, личные=%s",
+                        gid_s,
+                        getattr(mf, "id", None) or "—",
+                        getattr(lf, "id", None) or "—",
+                    )
+                except Exception as e:
+                    logger.warning("Проверка каналов guild %s: %s", gid_s, e)
         for gid_s in guilds_cfg:
             try:
                 await ensure_bot_info_thread(bot, int(gid_s))
@@ -3818,7 +3842,9 @@ async def on_message(message: discord.Message) -> None:
         return
     async with message.channel.typing():
         try:
-            out = await run_animeadd_for_user(message.guild, message.author.id, query)
+            out = await run_animeadd_for_user(
+                message.guild, message.author.id, query, client=bot
+            )
         except Exception:
             logger.exception("Текстовый animeadd")
             out = "Произошла ошибка при добавлении. Попробуйте `/anime add`."
@@ -3840,10 +3866,6 @@ def _normalize_discord_token(raw: str | None) -> str:
 
 
 def main() -> None:
-    # python bot.py загружает файл как __main__; import bot as core иначе даёт второй экземпляр YummyBot без session.
-    if __name__ == "__main__":
-        sys.modules["bot"] = sys.modules[__name__]
-
     load_dotenv()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
