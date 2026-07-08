@@ -553,12 +553,19 @@ def setup(bot_instance: discord.Client) -> None:
 
     @yummy_group.command(
         name="bind",
-        description="Привязать аккаунт YummyAnime (Bearer-токен из браузера)",
+        description="Привязать YummyAnime: Bearer или логин+пароль",
     )
     @app_commands.describe(
-        bearer_token="Authorization: Bearer … из DevTools (запрос к api.yani.tv)"
+        bearer_token="Authorization: Bearer … из DevTools (необязательно)",
+        login="Логин/почта YummyAnime (если без Bearer)",
+        password="Пароль YummyAnime (если без Bearer)",
     )
-    async def yummy_bind(interaction: discord.Interaction, bearer_token: str) -> None:
+    async def yummy_bind(
+        interaction: discord.Interaction,
+        bearer_token: str | None = None,
+        login: str | None = None,
+        password: str | None = None,
+    ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         app = (os.environ.get("YUMMY_APPLICATION_TOKEN") or "").strip()
         if not app:
@@ -567,22 +574,40 @@ def setup(bot_instance: discord.Client) -> None:
                 ephemeral=True,
             )
             return
-        t = (bearer_token or "").strip()
-        if t.lower().startswith("bearer "):
-            t = t[7:].strip()
-        if len(t) < 12:
-            await interaction.followup.send("Токен слишком короткий.", ephemeral=True)
-            return
         try:
             bind_session = await bot_instance.ensure_http_session()
         except Exception:
             logger.exception("HTTP session (yummy bind)")
             await interaction.followup.send("Сессия HTTP не готова.", ephemeral=True)
             return
+        t = (bearer_token or "").strip()
+        if t.lower().startswith("bearer "):
+            t = t[7:].strip()
+        if not t:
+            lg = (login or "").strip()
+            pw = (password or "").strip()
+            if not lg or not pw:
+                await interaction.followup.send(
+                    "Укажите либо **bearer_token**, либо пару **login + password**.",
+                    ephemeral=True,
+                )
+                return
+            t, auth_err = await yummy_api.yani_login_password(
+                bind_session, app, lg, pw, core.USER_AGENT
+            )
+            if not t:
+                await interaction.followup.send(
+                    auth_err or "Не удалось выполнить вход в YummyAnime API.",
+                    ephemeral=True,
+                )
+                return
+        if len(t) < 12:
+            await interaction.followup.send("Получен слишком короткий access token.", ephemeral=True)
+            return
         prof = await yummy_api.yani_get_profile(bind_session, app, t, core.USER_AGENT)
         if not prof:
             await interaction.followup.send(
-                "Не удалось получить профиль. Проверьте токен.",
+                "Не удалось получить профиль. Проверьте токен или логин/пароль.",
                 ephemeral=True,
             )
             return
