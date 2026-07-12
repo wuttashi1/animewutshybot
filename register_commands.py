@@ -38,7 +38,9 @@ async def _personal_slug_autocomplete(
 
     state = await core.read_state_copy()
     uid = str(interaction.user.id)
-    pl = (state.get("personal_lists") or {}).get(uid)
+    if not interaction.guild:
+        return []
+    pl = core.guild_personal_list(state, interaction.guild.id, uid)
     if not isinstance(pl, dict):
         return []
     order = pl.get("order")
@@ -50,7 +52,7 @@ async def _personal_slug_autocomplete(
         ks = str(k).strip()
         if not ks:
             continue
-        title = core._title_for_list_key(state, ks)
+        title = core._title_for_list_key(state, ks, interaction.guild.id)
         if cur and cur not in title.lower() and cur not in ks.lower():
             continue
         label = core._truncate(f"{title} ({ks})", 100)
@@ -135,7 +137,7 @@ def setup(bot_instance: discord.Client) -> None:
             await interaction.response.send_message(_GUILD_ONLY_MSG, ephemeral=True)
             return
         state = await core.read_state_copy()
-        groups = core._collect_duplicate_groups(state)
+        groups = core._collect_duplicate_groups(state, interaction.guild.id)
         if not groups:
             await interaction.response.send_message(
                 "Дубликатов не найдено: у каждого slug YummyAnime и каждого MAL id "
@@ -143,7 +145,7 @@ def setup(bot_instance: discord.Client) -> None:
                 ephemeral=True,
             )
             return
-        topics = state.get("anime_topics", {})
+        topics = core.guild_anime_topics(state, interaction.guild.id)
         lines: list[str] = [
             "Несколько **веток форума** привязаны к **одному и тому же** аниме. "
             "Оставляется тема из базы бота; остальные можно снять кнопкой ниже.",
@@ -298,15 +300,10 @@ def setup(bot_instance: discord.Client) -> None:
             return
 
         state = await core.read_state_copy()
-        key = str(interaction.user.id)
-        raw_imp = state.get("imported_mal", {}).get(key, [])
-        imported_ids: set[int] = set()
-        if isinstance(raw_imp, list):
-            for x in raw_imp:
-                try:
-                    imported_ids.add(int(x))
-                except (TypeError, ValueError):
-                    continue
+        gid = interaction.guild.id
+        imported_ids = core.guild_imported_ids(
+            state, "imported_mal", gid, interaction.user.id
+        )
 
         uid = interaction.user.id
         created_urls: list[str] = []
@@ -331,10 +328,10 @@ def setup(bot_instance: discord.Client) -> None:
             if info:
                 slug_key = core._clean_slug((info.get("anime_url") or "").strip())
                 thread, mst = await core.merge_adder_into_existing_topic(
-                    bot_instance, slug_key, uid
+                    bot_instance, gid, slug_key, uid
                 )
                 if mst == "merged":
-                    await core.mark_mal_imported(interaction.user.id, aid)
+                    await core.mark_mal_imported(interaction.user.id, aid, gid)
                     imported_ids.add(aid)
                     merge_ops += 1
                     if thread:
@@ -363,7 +360,7 @@ def setup(bot_instance: discord.Client) -> None:
                     await asyncio.sleep(0.35)
                     continue
                 if mst == "already":
-                    await core.mark_mal_imported(interaction.user.id, aid)
+                    await core.mark_mal_imported(interaction.user.id, aid, gid)
                     imported_ids.add(aid)
                     merge_ops += 1
                     try:
@@ -396,10 +393,10 @@ def setup(bot_instance: discord.Client) -> None:
                 )
             else:
                 thread, mst = await core.merge_adder_into_existing_topic(
-                    bot_instance, f"mal:{aid}", uid
+                    bot_instance, gid, f"mal:{aid}", uid
                 )
                 if mst == "merged":
-                    await core.mark_mal_imported(interaction.user.id, aid)
+                    await core.mark_mal_imported(interaction.user.id, aid, gid)
                     imported_ids.add(aid)
                     merge_ops += 1
                     if thread:
@@ -428,7 +425,7 @@ def setup(bot_instance: discord.Client) -> None:
                     await asyncio.sleep(0.35)
                     continue
                 if mst == "already":
-                    await core.mark_mal_imported(interaction.user.id, aid)
+                    await core.mark_mal_imported(interaction.user.id, aid, gid)
                     imported_ids.add(aid)
                     merge_ops += 1
                     try:
@@ -475,7 +472,7 @@ def setup(bot_instance: discord.Client) -> None:
             except Exception:
                 logger.exception("Личный список после новой темы из mal import")
 
-            await core.mark_mal_imported(interaction.user.id, aid)
+            await core.mark_mal_imported(interaction.user.id, aid, gid)
             imported_ids.add(aid)
             n_new += 1
             ju = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
@@ -819,8 +816,9 @@ def setup(bot_instance: discord.Client) -> None:
 
         uid = interaction.user.id
         uid_s = str(uid)
+        gid = interaction.guild.id
         state = await core.read_state_copy()
-        pl = (state.get("personal_lists") or {}).get(uid_s)
+        pl = core.guild_personal_list(state, gid, uid)
         if not isinstance(pl, dict):
             await interaction.followup.send(
                 "Личного списка ещё нет — сначала добавьте аниме через `/anime add`.",
@@ -834,9 +832,12 @@ def setup(bot_instance: discord.Client) -> None:
         if not slots:
             async with core._state_lock:
                 data = core._load_state()
-                pl2 = data.setdefault("personal_lists", {}).setdefault(uid_s, {})
+                gkey = core._gid_str(gid)
+                bucket = data.setdefault("personal_lists", {}).setdefault(gkey, {})
+                pl2 = bucket.setdefault(uid_s, {})
                 pl2["top5"] = []
-                data["personal_lists"][uid_s] = pl2
+                bucket[uid_s] = pl2
+                data["personal_lists"][gkey] = bucket
                 core._write_state(data)
             await core.rebuild_personal_list_display(
                 bot_instance, interaction.guild.id, uid, session=bot_instance.session
@@ -857,9 +858,12 @@ def setup(bot_instance: discord.Client) -> None:
 
         async with core._state_lock:
             data = core._load_state()
-            pl2 = data.setdefault("personal_lists", {}).setdefault(uid_s, {})
+            gkey = core._gid_str(gid)
+            bucket = data.setdefault("personal_lists", {}).setdefault(gkey, {})
+            pl2 = bucket.setdefault(uid_s, {})
             pl2["top5"] = uniq
-            data["personal_lists"][uid_s] = pl2
+            bucket[uid_s] = pl2
+            data["personal_lists"][gkey] = bucket
             core._write_state(data)
         await core.rebuild_personal_list_display(
             bot_instance, interaction.guild.id, uid, session=bot_instance.session
@@ -917,7 +921,9 @@ def setup(bot_instance: discord.Client) -> None:
                 f"Не удалось отправить панель: {e}", ephemeral=True
             )
             return
-        await core._set_personal_list_fields(oid, control_message_id=hub_msg.id)
+        await core._set_personal_list_fields(
+            interaction.guild.id, oid, control_message_id=hub_msg.id
+        )
         await interaction.followup.send(
             "Панель отправлена **вниз темы**. При необходимости удалите дубликат вручную.",
             ephemeral=True,
@@ -947,8 +953,9 @@ def setup(bot_instance: discord.Client) -> None:
 
         uid = interaction.user.id
         uid_s = str(uid)
+        gid = interaction.guild.id
         state = await core.read_state_copy()
-        pl = (state.get("personal_lists") or {}).get(uid_s)
+        pl = core.guild_personal_list(state, gid, uid)
         if not isinstance(pl, dict) or not pl.get("thread_id"):
             await interaction.response.send_message(
                 "Личной темы ещё нет — она создаётся при первом добавлении аниме.",
@@ -1017,7 +1024,9 @@ def setup(bot_instance: discord.Client) -> None:
         assert interaction.guild is not None
         mode = personal_display.normalize_display_mode(display_mode)
         uid = interaction.user.id
-        await core._set_personal_list_fields(uid, display_mode=mode, current_page=0)
+        await core._set_personal_list_fields(
+            interaction.guild.id, uid, display_mode=mode, current_page=0
+        )
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await core.rebuild_personal_list_display(
@@ -1614,7 +1623,7 @@ def setup(bot_instance: discord.Client) -> None:
             )
             return
         state = await core.read_state_copy()
-        titles = core.pick_roast_titles(state, target.id)
+        titles = core.pick_roast_titles(state, target.id, interaction.guild.id)
         msg = roaster.build_roast_message(target.mention, titles)
         await interaction.response.send_message(
             core._truncate(msg, core.DISCORD_CONTENT_LIMIT),

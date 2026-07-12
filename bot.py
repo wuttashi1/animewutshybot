@@ -497,6 +497,150 @@ def _default_state() -> dict[str, Any]:
     }
 
 
+def _is_anime_topic_entry(v: Any) -> bool:
+    return isinstance(v, dict) and "thread_id" in v
+
+
+def _is_personal_list_entry(v: Any) -> bool:
+    return isinstance(v, dict) and ("order" in v or "thread_id" in v)
+
+
+def _infer_legacy_guild_id(data: dict[str, Any]) -> str:
+    guilds = data.get("guilds") or {}
+    if isinstance(guilds, dict) and guilds:
+        def _setup_sort_key(gid: str) -> str:
+            g = guilds.get(gid)
+            if isinstance(g, dict):
+                return str(g.get("setup_at") or "")
+            return ""
+
+        return sorted(guilds.keys(), key=_setup_sort_key)[0]
+    raw = (os.environ.get("DISCORD_GUILD_ID") or "").strip()
+    return raw or "0"
+
+
+def _migrate_flat_to_guild_nested(
+    container: dict[str, Any],
+    *,
+    is_entry: Any,
+    legacy_guild_id: str,
+) -> None:
+    if not container:
+        return
+    for v in container.values():
+        if is_entry(v):
+            flat = {k: container[k] for k in list(container.keys())}
+            container.clear()
+            container[str(legacy_guild_id)] = flat
+            return
+        if isinstance(v, dict) and any(is_entry(sv) for sv in v.values()):
+            return
+
+
+def _migrate_imported_to_guild_nested(
+    container: dict[str, Any], legacy_guild_id: str
+) -> None:
+    if not container:
+        return
+    for v in container.values():
+        if isinstance(v, list):
+            flat = {k: container[k] for k in list(container.keys())}
+            container.clear()
+            container[str(legacy_guild_id)] = flat
+            return
+        if isinstance(v, dict) and any(isinstance(sv, list) for sv in v.values()):
+            return
+
+
+def _migrate_guild_scoped_state(data: dict[str, Any]) -> bool:
+    """Переносит плоские anime_topics/personal_lists/imported_* в вложенность по guild_id."""
+    legacy_gid = _infer_legacy_guild_id(data)
+    changed = False
+    topics = data.setdefault("anime_topics", {})
+    if isinstance(topics, dict):
+        before = json.dumps(topics, sort_keys=True)
+        _migrate_flat_to_guild_nested(
+            topics, is_entry=_is_anime_topic_entry, legacy_guild_id=legacy_gid
+        )
+        if json.dumps(topics, sort_keys=True) != before:
+            changed = True
+    pl = data.setdefault("personal_lists", {})
+    if isinstance(pl, dict):
+        before = json.dumps(pl, sort_keys=True)
+        _migrate_flat_to_guild_nested(
+            pl, is_entry=_is_personal_list_entry, legacy_guild_id=legacy_gid
+        )
+        if json.dumps(pl, sort_keys=True) != before:
+            changed = True
+    for key in ("imported_yummy", "imported_mal"):
+        imp = data.setdefault(key, {})
+        if isinstance(imp, dict):
+            before = json.dumps(imp, sort_keys=True)
+            _migrate_imported_to_guild_nested(imp, legacy_gid)
+            if json.dumps(imp, sort_keys=True) != before:
+                changed = True
+    return changed
+
+
+def _gid_str(guild_id: int | str) -> str:
+    return str(guild_id)
+
+
+def guild_anime_topics(state: dict[str, Any], guild_id: int | str) -> dict[str, Any]:
+    root = state.get("anime_topics") or {}
+    if not isinstance(root, dict):
+        return {}
+    bucket = root.get(_gid_str(guild_id))
+    return bucket if isinstance(bucket, dict) else {}
+
+
+def get_guild_anime_topic(
+    state: dict[str, Any], guild_id: int | str, key: str
+) -> dict[str, Any] | None:
+    ent = guild_anime_topics(state, guild_id).get(key)
+    return ent if isinstance(ent, dict) else None
+
+
+def guild_personal_lists_bucket(
+    state: dict[str, Any], guild_id: int | str
+) -> dict[str, Any]:
+    root = state.get("personal_lists") or {}
+    if not isinstance(root, dict):
+        return {}
+    bucket = root.get(_gid_str(guild_id))
+    return bucket if isinstance(bucket, dict) else {}
+
+
+def guild_personal_list(
+    state: dict[str, Any], guild_id: int | str, user_id: int | str
+) -> dict[str, Any] | None:
+    pl = guild_personal_lists_bucket(state, guild_id).get(_gid_str(user_id))
+    return pl if isinstance(pl, dict) else None
+
+
+def guild_imported_ids(
+    state: dict[str, Any],
+    collection_key: str,
+    guild_id: int | str,
+    user_id: int | str,
+) -> set[int]:
+    root = state.get(collection_key) or {}
+    if not isinstance(root, dict):
+        return set()
+    bucket = root.get(_gid_str(guild_id))
+    if not isinstance(bucket, dict):
+        return set()
+    raw = bucket.get(_gid_str(user_id), [])
+    out: set[int] = set()
+    if isinstance(raw, list):
+        for x in raw:
+            try:
+                out.add(int(x))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def _load_state() -> dict[str, Any]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_PATH.is_file():
@@ -528,6 +672,8 @@ def _load_state() -> dict[str, Any]:
         meta["bot_info_thread_id"] = None
     if "roaster_global_enabled" not in meta:
         meta["roaster_global_enabled"] = True
+    if _migrate_guild_scoped_state(data):
+        _write_state(data)
     return data
 
 
@@ -756,16 +902,21 @@ async def bind_mal_account(
         _write_state(data)
 
 
-async def mark_mal_imported(discord_user_id: int, mal_id: int) -> None:
+async def mark_mal_imported(
+    discord_user_id: int, mal_id: int, guild_id: int
+) -> None:
     async with _state_lock:
         data = _load_state()
-        key = str(discord_user_id)
-        cur = data["imported_mal"].get(key)
+        gid = _gid_str(guild_id)
+        uid = str(discord_user_id)
+        bucket = data.setdefault("imported_mal", {}).setdefault(gid, {})
+        cur = bucket.get(uid)
         if not isinstance(cur, list):
             cur = []
         if mal_id not in cur:
             cur.append(mal_id)
-        data["imported_mal"][key] = cur
+        bucket[uid] = cur
+        data["imported_mal"][gid] = bucket
         _write_state(data)
 
 
@@ -804,16 +955,21 @@ async def unbind_yummy_account(discord_user_id: int) -> None:
         _write_state(data)
 
 
-async def mark_yummy_imported(discord_user_id: int, anime_id: int) -> None:
+async def mark_yummy_imported(
+    discord_user_id: int, anime_id: int, guild_id: int
+) -> None:
     async with _state_lock:
         data = _load_state()
-        key = str(discord_user_id)
-        cur = data.setdefault("imported_yummy", {}).get(key)
+        gid = _gid_str(guild_id)
+        uid = str(discord_user_id)
+        bucket = data.setdefault("imported_yummy", {}).setdefault(gid, {})
+        cur = bucket.get(uid)
         if not isinstance(cur, list):
             cur = []
         if anime_id not in cur:
             cur.append(anime_id)
-        data["imported_yummy"][key] = cur
+        bucket[uid] = cur
+        data["imported_yummy"][gid] = bucket
         _write_state(data)
 
 
@@ -871,7 +1027,7 @@ def schedule_personal_list_refresh(
     """Debounce пересборки карточек; defer_ui — только state, без заливки канала (массовый импорт)."""
     if defer_ui:
         async def _mark_deferred() -> None:
-            await _set_personal_list_fields(user_id, ui_deferred=True)
+            await _set_personal_list_fields(guild_id, user_id, ui_deferred=True)
 
         asyncio.create_task(_mark_deferred())
         return
@@ -906,11 +1062,22 @@ class _DuplicateGroup:
     labels: list[str] = field(default_factory=list)
 
 
-def _collect_duplicate_groups(state: dict[str, Any]) -> list[_DuplicateGroup]:
+def _collect_duplicate_groups(
+    state: dict[str, Any], guild_id: int
+) -> list[_DuplicateGroup]:
     """Несколько тем в форуме на одно аниме (одинаковый slug YummyAnime или один mal_id)."""
     threads_raw = state.get("threads", {})
     if not isinstance(threads_raw, dict):
         return []
+
+    topics = guild_anime_topics(state, guild_id)
+    guild_thread_ids: set[int] = set()
+    for ent in topics.values():
+        if isinstance(ent, dict):
+            try:
+                guild_thread_ids.add(int(ent.get("thread_id") or 0))
+            except (TypeError, ValueError):
+                pass
 
     slug_to: dict[str, list[int]] = defaultdict(list)
     mal_to: dict[int, list[int]] = defaultdict(list)
@@ -921,6 +1088,8 @@ def _collect_duplicate_groups(state: dict[str, Any]) -> list[_DuplicateGroup]:
         try:
             tid = int(tid_s)
         except (TypeError, ValueError):
+            continue
+        if guild_thread_ids and tid not in guild_thread_ids:
             continue
         slug = (meta.get("yummy_slug") or "").strip()
         if slug:
@@ -977,20 +1146,27 @@ def _pick_keeper_thread_id(
     return min(tids)
 
 
-async def purge_thread_from_state(thread_id: int) -> None:
+async def purge_thread_from_state(
+    thread_id: int, guild_id: int | None = None
+) -> None:
     async with _state_lock:
         data = _load_state()
         data["threads"].pop(str(thread_id), None)
         data["ratings"].pop(str(thread_id), None)
-        topics = data.setdefault("anime_topics", {})
-        drop_keys = [
-            k
-            for k, v in topics.items()
-            if isinstance(v, dict)
-            and int(v.get("thread_id") or 0) == thread_id
-        ]
-        for k in drop_keys:
-            del topics[k]
+        topics_root = data.setdefault("anime_topics", {})
+        for gid, topics in list(topics_root.items()):
+            if guild_id is not None and str(gid) != str(guild_id):
+                continue
+            if not isinstance(topics, dict):
+                continue
+            drop_keys = [
+                k
+                for k, v in topics.items()
+                if isinstance(v, dict)
+                and int(v.get("thread_id") or 0) == thread_id
+            ]
+            for k in drop_keys:
+                del topics[k]
         _write_state(data)
 
 
@@ -1000,6 +1176,7 @@ def thread_has_rating_slot(state: dict[str, Any], thread_id: int) -> bool:
 
 
 async def register_anime_topic_entry(
+    guild_id: int,
     key: str,
     thread_id: int,
     starter_message_id: int,
@@ -1012,7 +1189,8 @@ async def register_anime_topic_entry(
 ) -> None:
     async with _state_lock:
         data = _load_state()
-        topics = data.setdefault("anime_topics", {})
+        gid = _gid_str(guild_id)
+        topics = data.setdefault("anime_topics", {}).setdefault(gid, {})
         topics[key] = {
             "thread_id": thread_id,
             "starter_message_id": starter_message_id,
@@ -1022,6 +1200,7 @@ async def register_anime_topic_entry(
             "mal_page": mal_page,
             "image_notes": list(image_notes or []),
         }
+        data["anime_topics"][gid] = topics
         _write_state(data)
 
 
@@ -1039,13 +1218,15 @@ def _parse_adder_ids(raw: Any) -> list[int]:
 
 async def merge_adder_into_existing_topic(
     client: discord.Client,
+    guild_id: int,
     key: str,
     adder_id: int,
 ) -> tuple[discord.Thread | None, str]:
     """status: '' нет записи, merged, already, edit_failed, fetch_failed."""
     async with _state_lock:
         data = _load_state()
-        topics = data.setdefault("anime_topics", {})
+        gid = _gid_str(guild_id)
+        topics = data.setdefault("anime_topics", {}).setdefault(gid, {})
         entry = topics.get(key)
         if not isinstance(entry, dict):
             return None, ""
@@ -1102,11 +1283,13 @@ async def merge_adder_into_existing_topic(
 
     async with _state_lock:
         data = _load_state()
-        topics = data.setdefault("anime_topics", {})
+        gid = _gid_str(guild_id)
+        topics = data.setdefault("anime_topics", {}).setdefault(gid, {})
         ent = topics.get(key)
         if isinstance(ent, dict):
             ent["adders"] = new_adders
             topics[key] = ent
+            data["anime_topics"][gid] = topics
             _write_state(data)
 
     try:
@@ -1151,10 +1334,12 @@ async def _ingest_forum_thread_from_discord(
     adders = _mention_ids_near_adders(starter.content or "")
     mal_page = page_url if kind == "mal" else ""
     pu = page_url if kind == "yummy" else ""
+    guild_id = forum.guild.id
     topics_changed = False
     async with _state_lock:
         data = _load_state()
-        topics = data.setdefault("anime_topics", {})
+        gid = _gid_str(guild_id)
+        topics = data.setdefault("anime_topics", {}).setdefault(gid, {})
         ent = topics.get(key)
         if isinstance(ent, dict) and int(ent.get("thread_id", 0)) != thread.id:
             return False
@@ -1181,6 +1366,7 @@ async def _ingest_forum_thread_from_discord(
                 "image_notes": [],
             }
             topics_changed = True
+        data["anime_topics"][gid] = topics
         _write_state(data)
     mid = int(key.split(":")[1]) if kind == "mal" else None
     ys = key if kind == "yummy" else None
@@ -1242,7 +1428,7 @@ def list_discord_added_anime_for_user(
     """(название, URL темы) для embed."""
     out: list[tuple[str, str]] = []
     uid = user_id
-    topics = state.get("anime_topics", {})
+    topics = guild_anime_topics(state, guild_id)
     threads_raw = state.get("threads", {})
     for _key, ent in topics.items():
         if not isinstance(ent, dict):
@@ -1454,10 +1640,10 @@ async def is_roaster_active(guild_id: int) -> bool:
 
 
 def pick_roast_titles(
-    state: dict[str, Any], user_id: int, *, limit: int = 8
+    state: dict[str, Any], user_id: int, guild_id: int, *, limit: int = 8
 ) -> list[str]:
     titles: list[str] = []
-    pl = (state.get("personal_lists") or {}).get(str(user_id))
+    pl = guild_personal_list(state, guild_id, user_id)
     if isinstance(pl, dict):
         order = pl.get("order")
         if isinstance(order, list):
@@ -1465,10 +1651,10 @@ def pick_roast_titles(
                 ks = str(k).strip()
                 if not ks:
                     continue
-                titles.append(_title_for_list_key(state, ks))
+                titles.append(_title_for_list_key(state, ks, guild_id))
                 if len(titles) >= limit:
                     return titles
-    topics = state.get("anime_topics") or {}
+    topics = guild_anime_topics(state, guild_id)
     if isinstance(topics, dict):
         for _key, ent in topics.items():
             if not isinstance(ent, dict):
@@ -1577,14 +1763,15 @@ async def guild_not_configured_message(guild_id: int) -> str:
     )
 
 
-def _title_for_list_key(state: dict[str, Any], key: str) -> str:
+def _title_for_list_key(
+    state: dict[str, Any], key: str, guild_id: int | str
+) -> str:
     st = state.get("slug_titles", {})
     if isinstance(st, dict):
         t = (st.get(key) or "").strip()
         if t:
             return t
-    topics = state.get("anime_topics", {})
-    ent = topics.get(key) if isinstance(topics, dict) else None
+    ent = get_guild_anime_topic(state, guild_id, key)
     if isinstance(ent, dict):
         tid = str(ent.get("thread_id") or "")
         meta = state.get("threads", {}).get(tid)
@@ -1596,8 +1783,7 @@ def _title_for_list_key(state: dict[str, Any], key: str) -> str:
 
 
 def _jump_for_list_key(state: dict[str, Any], guild_id: int, key: str) -> str:
-    topics = state.get("anime_topics", {})
-    ent = topics.get(key) if isinstance(topics, dict) else None
+    ent = get_guild_anime_topic(state, guild_id, key)
     if isinstance(ent, dict):
         tid = int(ent.get("thread_id") or 0)
         if tid:
@@ -1681,6 +1867,7 @@ def _owner_id_from_list_starter_message(message: discord.Message | None) -> int 
 
 
 async def persist_personal_thread_binding(
+    guild_id: int,
     owner_id: int,
     thread: discord.Thread,
     starter: discord.Message | None,
@@ -1688,8 +1875,10 @@ async def persist_personal_thread_binding(
     """Сохраняет thread_id и starter_message_id для личного списка (привязка темы)."""
     async with _state_lock:
         data = _load_state()
+        gid = _gid_str(guild_id)
         uid = str(owner_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        bucket = data.setdefault("personal_lists", {}).setdefault(gid, {})
+        pl = bucket.setdefault(uid, {})
         pl["thread_id"] = thread.id
         if starter is not None:
             pl["starter_message_id"] = starter.id
@@ -1704,7 +1893,8 @@ async def persist_personal_thread_binding(
         pl.setdefault("recent_keys", [])
         pl.setdefault("card_cache", {})
         pl.setdefault("ui_deferred", False)
-        data["personal_lists"][uid] = pl
+        bucket[uid] = pl
+        data["personal_lists"][gid] = bucket
         _write_state(data)
 
 
@@ -1749,9 +1939,10 @@ async def resolve_personal_list_owner_for_interaction(
         return None
 
     state = await read_state_copy()
-    oid = _list_owner_id_by_thread_id(state, ch.id)
+    gid = interaction.guild.id
+    oid = _list_owner_id_by_thread_id(state, ch.id, gid)
     if oid is not None:
-        pl = (state.get("personal_lists") or {}).get(str(oid))
+        pl = guild_personal_list(state, gid, oid)
         if isinstance(pl, dict):
             return oid, pl
         await interaction.response.send_message("Нет данных списка.", ephemeral=True)
@@ -1774,9 +1965,9 @@ async def resolve_personal_list_owner_for_interaction(
         )
         return None
 
-    await persist_personal_thread_binding(inferred, ch, starter)
+    await persist_personal_thread_binding(gid, inferred, ch, starter)
     state2 = await read_state_copy()
-    pl2 = (state2.get("personal_lists") or {}).get(str(inferred))
+    pl2 = guild_personal_list(state2, gid, inferred)
     if not isinstance(pl2, dict):
         await interaction.response.send_message(
             "Не удалось сохранить привязку темы.", ephemeral=True
@@ -1818,7 +2009,7 @@ class PersonalTopicHubView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         client = interaction.client
         sess = getattr(client, "session", None)
-        await _set_personal_list_fields(owner_id, ui_deferred=False)
+        await _set_personal_list_fields(interaction.guild.id, owner_id, ui_deferred=False)
         try:
             await rebuild_personal_list_display(
                 client, interaction.guild.id, owner_id, session=sess
@@ -1854,9 +2045,9 @@ class PersonalTopicHubView(discord.ui.View):
         except ValueError:
             idx = -1
         nxt = PERSONAL_ACCENT_PALETTE[(idx + 1) % len(PERSONAL_ACCENT_PALETTE)]
-        await _set_personal_list_fields(owner_id, accent_color=nxt)
+        await _set_personal_list_fields(interaction.guild.id, owner_id, accent_color=nxt)
         st = await read_state_copy()
-        pl2 = (st.get("personal_lists") or {}).get(str(owner_id), pl)
+        pl2 = guild_personal_list(st, interaction.guild.id, owner_id) or pl
         mem = interaction.guild.get_member(owner_id) if interaction.guild else None
         dn = mem.display_name if mem else str(owner_id)
         hub_embed = _personal_hub_embed(pl2 if isinstance(pl2, dict) else pl, dn)
@@ -1894,7 +2085,7 @@ class PersonalTopicHubView(discord.ui.View):
             )
             return
         new_val = not bool(pl.get("show_numbers"))
-        await _set_personal_list_fields(owner_id, show_numbers=new_val)
+        await _set_personal_list_fields(interaction.guild.id, owner_id, show_numbers=new_val)
         await interaction.response.send_message(
             f"Нумерация карточек: **{'вкл.' if new_val else 'выкл.'}** "
             "— нажми **Обновить**, чтобы применить.",
@@ -1921,7 +2112,7 @@ class PersonalTopicHubView(discord.ui.View):
             )
             return
         new_val = not bool(pl.get("compact_cards"))
-        await _set_personal_list_fields(owner_id, compact_cards=new_val)
+        await _set_personal_list_fields(interaction.guild.id, owner_id, compact_cards=new_val)
         await interaction.response.send_message(
             f"Компактные карточки: **{'вкл.' if new_val else 'выкл.'}** "
             "— нажми **Обновить**.",
@@ -1949,7 +2140,10 @@ class PersonalTopicHubView(discord.ui.View):
         rated_n = sum(
             1
             for k in keys
-            if _user_thread_rating_for_key(state, owner_id, k) is not None
+            if _user_thread_rating_for_key(
+                state, interaction.guild.id, owner_id, k
+            )
+            is not None
         )
         lines = [
             f"**Всего тайтлов:** {len(keys)}",
@@ -1991,7 +2185,9 @@ class PersonalTopicHubView(discord.ui.View):
             idx = 0
         nxt = order_modes[(idx + 1) % len(order_modes)]
         labels = {"summary": "Сводка", "paged": "Страницы", "gallery": "Галерея"}
-        await _set_personal_list_fields(owner_id, display_mode=nxt, current_page=0)
+        await _set_personal_list_fields(
+            interaction.guild.id, owner_id, display_mode=nxt, current_page=0
+        )
         await interaction.response.send_message(
             f"Режим: **{labels[nxt]}**. Нажмите **Обновить**, чтобы применить.",
             ephemeral=True,
@@ -2184,7 +2380,7 @@ class PersonalTopicHubView(discord.ui.View):
         state = await read_state_copy()
         lines: list[str] = []
         for i, k in enumerate(_ordered_keys_for_personal(pl), 1):
-            t = _title_for_list_key(state, k)
+            t = _title_for_list_key(state, k, interaction.guild.id)
             u = _jump_for_list_key(state, interaction.guild.id, k)
             lines.append(f"{i}. [{t}]({u})")
         body = "\n".join(lines) if lines else "_пусто_"
@@ -2195,23 +2391,37 @@ class PersonalTopicHubView(discord.ui.View):
         )
 
 
-def _list_owner_id_by_thread_id(state: dict[str, Any], thread_id: int) -> int | None:
-    for uid_s, pl in (state.get("personal_lists") or {}).items():
-        if not isinstance(pl, dict):
+def _list_owner_id_by_thread_id(
+    state: dict[str, Any], thread_id: int, guild_id: int | None = None
+) -> int | None:
+    if guild_id is not None:
+        for uid_s, pl in guild_personal_lists_bucket(state, guild_id).items():
+            if not isinstance(pl, dict):
+                continue
+            try:
+                if int(pl.get("thread_id") or 0) == thread_id:
+                    return int(uid_s)
+            except (TypeError, ValueError):
+                continue
+        return None
+    for _gid, bucket in (state.get("personal_lists") or {}).items():
+        if not isinstance(bucket, dict):
             continue
-        try:
-            if int(pl.get("thread_id") or 0) == thread_id:
-                return int(uid_s)
-        except (TypeError, ValueError):
-            continue
+        for uid_s, pl in bucket.items():
+            if not isinstance(pl, dict):
+                continue
+            try:
+                if int(pl.get("thread_id") or 0) == thread_id:
+                    return int(uid_s)
+            except (TypeError, ValueError):
+                continue
     return None
 
 
 def _user_thread_rating_for_key(
-    state: dict[str, Any], user_id: int, anime_key: str
+    state: dict[str, Any], guild_id: int, user_id: int, anime_key: str
 ) -> int | None:
-    topics = state.get("anime_topics", {})
-    ent = topics.get(anime_key) if isinstance(topics, dict) else None
+    ent = get_guild_anime_topic(state, guild_id, anime_key)
     if not isinstance(ent, dict):
         return None
     tid = str(ent.get("thread_id") or "")
@@ -2233,11 +2443,12 @@ def _user_thread_rating_for_key(
 async def _fetch_personal_card_meta(
     session: aiohttp.ClientSession | None,
     state: dict[str, Any],
+    guild_id: int,
     anime_key: str,
 ) -> dict[str, Any]:
     """title, poster_url, page_url, global_score (str|None), source."""
     key = str(anime_key).strip()
-    fallback_title = _title_for_list_key(state, key)
+    fallback_title = _title_for_list_key(state, key, guild_id)
     if key.startswith("mal:"):
         rest = key.split(":", 1)[-1]
         try:
@@ -2303,7 +2514,7 @@ def _build_personal_anime_card_embed(
     show_numbers: bool,
 ) -> discord.Embed:
     jump = _jump_for_list_key(state, guild_id, anime_key)
-    title = (meta.get("title") or _title_for_list_key(state, anime_key)).strip()
+    title = (meta.get("title") or _title_for_list_key(state, anime_key, guild_id)).strip()
     prefix = f"`#{display_index}` · " if show_numbers else ""
     top_badge = "⭐ **В вашем топе** · " if in_top else ""
     embed = discord.Embed(
@@ -2321,7 +2532,7 @@ def _build_personal_anime_card_embed(
     gscore = meta.get("global_score")
     global_line = f"**{gscore}**/10" if gscore else "_нет данных_"
 
-    ur = _user_thread_rating_for_key(state, owner_id, anime_key)
+    ur = _user_thread_rating_for_key(state, guild_id, owner_id, anime_key)
     if ur is not None:
         user_line = f"**{ur}**/10"
     else:
@@ -2367,6 +2578,7 @@ def _personal_hub_embed(pl: dict[str, Any], display_name: str) -> discord.Embed:
 
 
 async def _save_personal_thread_meta(
+    guild_id: int,
     user_id: int,
     *,
     thread_id: int,
@@ -2375,8 +2587,10 @@ async def _save_personal_thread_meta(
 ) -> None:
     async with _state_lock:
         data = _load_state()
+        gid = _gid_str(guild_id)
         uid = str(user_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        bucket = data.setdefault("personal_lists", {}).setdefault(gid, {})
+        pl = bucket.setdefault(uid, {})
         pl["thread_id"] = thread_id
         pl["starter_message_id"] = starter_message_id
         if control_message_id is not None:
@@ -2390,18 +2604,24 @@ async def _save_personal_thread_meta(
         pl.setdefault("recent_keys", [])
         pl.setdefault("card_cache", {})
         pl.setdefault("ui_deferred", False)
-        data["personal_lists"][uid] = pl
+        bucket[uid] = pl
+        data["personal_lists"][gid] = bucket
         _write_state(data)
 
 
-async def _set_personal_list_fields(user_id: int, **fields: Any) -> None:
+async def _set_personal_list_fields(
+    guild_id: int, user_id: int, **fields: Any
+) -> None:
     async with _state_lock:
         data = _load_state()
+        gid = _gid_str(guild_id)
         uid = str(user_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        bucket = data.setdefault("personal_lists", {}).setdefault(gid, {})
+        pl = bucket.setdefault(uid, {})
         for k, v in fields.items():
             pl[k] = v
-        data["personal_lists"][uid] = pl
+        bucket[uid] = pl
+        data["personal_lists"][gid] = bucket
         _write_state(data)
 
 
@@ -2414,6 +2634,22 @@ async def rebuild_personal_list_display(
     incremental: bool = False,
 ) -> None:
     """Пересборка личного списка: summary / paged / gallery."""
+
+    async def _write_fields(user_id_arg: int, **fields: Any) -> None:
+        await _set_personal_list_fields(guild_id, user_id_arg, **fields)
+
+    def _title_for_key_guild(state: dict[str, Any], key: str) -> str:
+        return _title_for_list_key(state, key, guild_id)
+
+    async def _fetch_meta_guild(
+        session_arg: aiohttp.ClientSession | None,
+        state: dict[str, Any],
+        anime_key: str,
+    ) -> dict[str, Any]:
+        return await _fetch_personal_card_meta(
+            session_arg, state, guild_id, anime_key
+        )
+
     await personal_display.rebuild_display(
         client,
         guild_id,
@@ -2421,11 +2657,11 @@ async def rebuild_personal_list_display(
         session=session,
         incremental=incremental,
         read_state=read_state_copy,
-        write_personal_fields=_set_personal_list_fields,
-        title_for_key=_title_for_list_key,
+        write_personal_fields=_write_fields,
+        title_for_key=_title_for_key_guild,
         jump_for_key=_jump_for_list_key,
         ordered_keys=_ordered_keys_for_personal,
-        fetch_meta=_fetch_personal_card_meta,
+        fetch_meta=_fetch_meta_guild,
         build_card_embed=_build_personal_anime_card_embed,
         hub_embed_builder=_personal_hub_embed,
         hub_view_factory=PersonalTopicHubView,
@@ -2443,9 +2679,10 @@ async def ensure_personal_list_thread(
 ) -> discord.Thread | None:
     """Создаёт тему в LIST_FORUM при первом добавлении, если её ещё нет."""
     uid = member.id
+    gid = guild.id
     async with _state_lock:
         data = _load_state()
-        pl_raw = (data.get("personal_lists") or {}).get(str(uid))
+        pl_raw = guild_personal_list(data, gid, uid)
         existing_id = pl_raw.get("thread_id") if isinstance(pl_raw, dict) else None
 
     if existing_id:
@@ -2508,6 +2745,7 @@ async def ensure_personal_list_thread(
 
     if starter and hub_msg:
         await _save_personal_thread_meta(
+            gid,
             uid,
             thread_id=thread.id,
             starter_message_id=starter.id,
@@ -2528,11 +2766,15 @@ async def append_user_anime_to_personal_state(
     key = str(key).strip()
     if not key:
         return
-    title = (title or "").strip() or _title_for_list_key(await read_state_copy(), key)
+    title = (title or "").strip() or _title_for_list_key(
+        await read_state_copy(), key, guild.id
+    )
     async with _state_lock:
         data = _load_state()
+        gid = _gid_str(guild.id)
         uid = str(user_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        bucket = data.setdefault("personal_lists", {}).setdefault(gid, {})
+        pl = bucket.setdefault(uid, {})
         order = pl.get("order")
         if not isinstance(order, list):
             order = []
@@ -2547,7 +2789,8 @@ async def append_user_anime_to_personal_state(
         st = data.setdefault("slug_titles", {})
         st[key] = title[:500]
         data["slug_titles"] = st
-        data["personal_lists"][uid] = pl
+        bucket[uid] = pl
+        data["personal_lists"][gid] = bucket
         _write_state(data)
 
     member = guild.get_member(user_id)
@@ -2565,12 +2808,12 @@ def list_personal_anime_pairs(
     state: dict[str, Any], guild_id: int, user_id: int
 ) -> list[tuple[str, str]]:
     uid_s = str(user_id)
-    pl = (state.get("personal_lists") or {}).get(uid_s)
+    pl = guild_personal_list(state, guild_id, user_id)
     if not isinstance(pl, dict):
         return []
     out: list[tuple[str, str]] = []
     for k in _ordered_keys_for_personal(pl):
-        t = _title_for_list_key(state, k)
+        t = _title_for_list_key(state, k, guild_id)
         u = _jump_for_list_key(state, guild_id, k)
         out.append((t, u))
     return out
@@ -2584,9 +2827,10 @@ async def sync_personal_list_from_anime_topics(
     """
     async with _state_lock:
         data = _load_state()
-        topics = data.get("anime_topics", {})
-        if not isinstance(topics, dict):
-            return 0, "Нет данных anime_topics."
+        gid = _gid_str(guild.id)
+        topics = guild_anime_topics(data, guild.id)
+        if not topics:
+            return 0, "Нет данных anime_topics для этого сервера."
         keys: list[str] = []
         for key, ent in topics.items():
             if not isinstance(ent, dict):
@@ -2596,16 +2840,18 @@ async def sync_personal_list_from_anime_topics(
             ks = str(key).strip()
             if ks:
                 keys.append(ks)
-        keys.sort(key=lambda x: _title_for_list_key(data, x).lower())
+        keys.sort(key=lambda x: _title_for_list_key(data, x, guild.id).lower())
         uid = str(target_id)
-        pl = data.setdefault("personal_lists", {}).setdefault(uid, {})
+        bucket = data.setdefault("personal_lists", {}).setdefault(gid, {})
+        pl = bucket.setdefault(uid, {})
         old_top = pl.get("top5")
         if not isinstance(old_top, list):
             old_top = []
         new_top = [str(x).strip() for x in old_top if str(x).strip() in keys][:5]
         pl["order"] = keys
         pl["top5"] = new_top
-        data["personal_lists"][uid] = pl
+        bucket[uid] = pl
+        data["personal_lists"][gid] = bucket
         # обновить кэш названий из threads
         threads_raw = data.get("threads", {})
         st = data.setdefault("slug_titles", {})
@@ -2670,14 +2916,9 @@ async def run_yummy_list_import_for_member(
 
     entries = yummy_api.filter_yummy_entries_by_status(items or [], list_filter)
 
-    raw_imp = state.get("imported_yummy", {}).get(str(discord_user_id), [])
-    imported_ids: set[int] = set()
-    if isinstance(raw_imp, list):
-        for x in raw_imp:
-            try:
-                imported_ids.add(int(x))
-            except (TypeError, ValueError):
-                continue
+    imported_ids = guild_imported_ids(
+        state, "imported_yummy", guild.id, discord_user_id
+    )
 
     forum = await resolve_forum_channel(bot, guild.id)
     if not forum:
@@ -2724,9 +2965,11 @@ async def run_yummy_list_import_for_member(
 
         if info:
             slug_key = _clean_slug((info.get("anime_url") or "").strip())
-            thread, mst = await merge_adder_into_existing_topic(bot, slug_key, uid)
+            thread, mst = await merge_adder_into_existing_topic(
+                bot, guild.id, slug_key, uid
+            )
             if mst == "merged":
-                await mark_yummy_imported(uid, aid)
+                await mark_yummy_imported(uid, aid, guild.id)
                 imported_ids.add(aid)
                 merge_ops += 1
                 if thread:
@@ -2751,7 +2994,7 @@ async def run_yummy_list_import_for_member(
                 await asyncio.sleep(0.35)
                 continue
             if mst == "already":
-                await mark_yummy_imported(uid, aid)
+                await mark_yummy_imported(uid, aid, guild.id)
                 imported_ids.add(aid)
                 merge_ops += 1
                 try:
@@ -2798,7 +3041,7 @@ async def run_yummy_list_import_for_member(
         except Exception:
             logger.exception("Личный список после новой темы Yummy import")
 
-        await mark_yummy_imported(uid, aid)
+        await mark_yummy_imported(uid, aid, guild.id)
         imported_ids.add(aid)
         n_new += 1
         ju = thread.jump_url if hasattr(thread, "jump_url") else f"<#{thread.id}>"
@@ -2936,6 +3179,7 @@ async def create_yummy_forum_thread(
     )
     if slug_key:
         await register_anime_topic_entry(
+            forum.guild.id,
             slug_key,
             thread.id,
             starter.id,
@@ -3023,6 +3267,7 @@ async def create_mal_only_forum_thread(
 
     await register_thread_meta(thread.id, title=title, mal_id=mal_id, yummy_slug=None)
     await register_anime_topic_entry(
+        forum.guild.id,
         f"mal:{mal_id}",
         thread.id,
         starter.id,
@@ -3289,7 +3534,7 @@ class AddToMyListPanelView(discord.ui.View):
             return
 
         thread, st = await merge_adder_into_existing_topic(
-            interaction.client, key, interaction.user.id
+            interaction.client, interaction.guild.id, key, interaction.user.id
         )
         if st in ("merged", "already"):
             try:
@@ -3675,7 +3920,9 @@ async def run_animeadd_for_user(
     if not ch:
         return "Канал форума не настроен. Админ сервера: **`/bot setup`**."
     slug_key = _clean_slug((info.get("anime_url") or slug or "").strip())
-    thread, merge_st = await merge_adder_into_existing_topic(dc, slug_key, user_id)
+    thread, merge_st = await merge_adder_into_existing_topic(
+        dc, guild.id, slug_key, user_id
+    )
     if merge_st == "merged":
         link = thread.jump_url if thread and hasattr(thread, "jump_url") else f"<#{thread.id}>"
         tname = thread.name[:200] if thread else (info.get("title") or slug_key)

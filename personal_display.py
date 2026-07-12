@@ -184,7 +184,9 @@ class PersonalPagerView(discord.ui.View):
             )
             return
         cur = int(pl.get("current_page") or 0)
-        await _set_personal_list_fields(owner_id, current_page=max(0, cur + delta))
+        await _set_personal_list_fields(
+            interaction.guild.id, owner_id, current_page=max(0, cur + delta)
+        )
         await interaction.response.defer(ephemeral=True)
         await rebuild_personal_list_display(
             interaction.client,
@@ -218,9 +220,11 @@ async def rebuild_display(
     default_accent: int,
 ) -> None:
     """Пересборка UI личного списка с режимами summary / paged / gallery."""
+    from bot import guild_personal_list  # noqa: PLC0415
+
     state = await read_state()
     uid_s = str(user_id)
-    pl = (state.get("personal_lists") or {}).get(uid_s)
+    pl = guild_personal_list(state, guild_id, user_id)
     if not isinstance(pl, dict):
         return
     try:
@@ -321,7 +325,7 @@ async def rebuild_display(
         except discord.HTTPException:
             hub_msg = None
 
-    pl = (await read_state()).get("personal_lists", {}).get(uid_s, pl)
+    pl = guild_personal_list(await read_state(), guild_id, user_id) or pl
     if not isinstance(pl, dict):
         return
 

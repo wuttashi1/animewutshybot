@@ -68,7 +68,7 @@ async def _pick_delivery_channel(
                 return ch
 
     state = await core.read_state_copy()
-    pl = (state.get("personal_lists") or {}).get(str(victim_id))
+    pl = core.guild_personal_list(state, guild.id, victim_id)
     if isinstance(pl, dict) and pl.get("thread_id"):
         try:
             tid = int(pl["thread_id"])
@@ -98,7 +98,7 @@ async def send_roast_to_channel(
     if not await core.is_roaster_active(guild.id):
         return False
     state = await core.read_state_copy()
-    titles = core.pick_roast_titles(state, member.id)
+    titles = core.pick_roast_titles(state, member.id, guild.id)
     text = roaster.build_roast_message(member.mention, titles)
     text = core._truncate(text, core.DISCORD_CONTENT_LIMIT)
     allowed = discord.AllowedMentions(users=[member], roles=False, everyone=False)
@@ -158,7 +158,7 @@ def _members_with_list(guild: discord.Guild, state: dict[str, Any]) -> list[disc
     for m in guild.members:
         if m.bot:
             continue
-        if core.pick_roast_titles(state, m.id):
+        if core.pick_roast_titles(state, m.id, guild.id):
             out.append(m)
     return out
 
