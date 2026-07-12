@@ -28,6 +28,42 @@ def build_yani_headers(
     return h
 
 
+def _extract_token_from_payload(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        for key in ("token", "access_token", "accessToken", "jwt"):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for key in ("response", "data", "result", "user", "profile"):
+            tok = _extract_token_from_payload(payload.get(key))
+            if tok:
+                return tok
+    elif isinstance(payload, list):
+        for x in payload:
+            tok = _extract_token_from_payload(x)
+            if tok:
+                return tok
+    return None
+
+
+def _extract_token_from_headers(headers: "aiohttp.typedefs.LooseHeaders") -> str | None:
+    if not headers:
+        return None
+    # Некоторые реализации возвращают токен не в JSON, а в заголовках.
+    for key in ("Authorization", "X-Token", "X-Access-Token", "Set-Authorization"):
+        try:
+            v = headers.get(key)  # type: ignore[union-attr]
+        except Exception:
+            v = None
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if s.lower().startswith("bearer "):
+                s = s[7:].strip()
+            if s:
+                return s
+    return None
+
+
 async def _yani_request(
     session: aiohttp.ClientSession,
     method: str,
@@ -69,6 +105,148 @@ async def yani_get_profile(
         return None
     inner = data.get("response")
     return inner if isinstance(inner, dict) else None
+
+
+async def _fetch_token_with_cookie(
+    session: aiohttp.ClientSession,
+    app_token: str,
+    user_agent: str,
+    cookie_header: str,
+) -> str | None:
+    """После login без need_json токен часто доступен только через cookie + GET token."""
+    extra = {"Cookie": cookie_header}
+    for path in ("/users/token", "/profile/token"):
+        url = f"{YANI_BASE}{path}"
+        headers = build_yani_headers(app_token, None, user_agent)
+        headers.update(extra)
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    continue
+                try:
+                    data = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    data = None
+                tok = _extract_token_from_payload(data)
+                if tok:
+                    return tok
+                tok = _extract_token_from_headers(resp.headers)
+                if tok:
+                    return tok
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("YANI cookie token fetch failed %s: %s", path, e)
+    return None
+
+
+def _cookie_header_from_response(resp: aiohttp.ClientResponse) -> str | None:
+    parts: list[str] = []
+    for name, morsel in resp.cookies.items():
+        val = getattr(morsel, "value", None) or str(morsel)
+        if name and val:
+            parts.append(f"{name}={val}")
+    if parts:
+        return "; ".join(parts)
+    raw = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie")
+    if isinstance(raw, str) and raw.strip():
+        return raw.split(";")[0].strip()
+    return None
+
+
+async def _token_from_login_response(
+    session: aiohttp.ClientSession,
+    app_token: str,
+    user_agent: str,
+    resp: aiohttp.ClientResponse,
+    data: Any,
+) -> str | None:
+    tok = _extract_token_from_payload(data)
+    if tok:
+        return tok
+    tok = _extract_token_from_headers(resp.headers)
+    if tok:
+        return tok
+    for name in ("token", "access_token", "jwt"):
+        c = resp.cookies.get(name)
+        if c and c.value:
+            return c.value.strip()
+    cookie_hdr = _cookie_header_from_response(resp)
+    if cookie_hdr:
+        return await _fetch_token_with_cookie(session, app_token, user_agent, cookie_hdr)
+    return None
+
+
+async def yani_login_password(
+    session: aiohttp.ClientSession,
+    app_token: str,
+    login: str,
+    password: str,
+    user_agent: str,
+) -> tuple[str | None, str | None]:
+    """
+    Авторизация по логину/паролю в API YummyAnime.
+    Возвращает (access_token, err_text).
+    """
+    lg = (login or "").strip()
+    pw = (password or "").strip()
+    if not lg or not pw:
+        return None, "Пустой логин или пароль."
+
+    headers = build_yani_headers(app_token, None, user_agent)
+    # Swagger: need_json=true — иначе токен только в cookie, не в JSON body.
+    payloads = (
+        {"need_json": True, "login": lg, "password": pw},
+        {"login": lg, "password": pw, "need_json": True},
+        {"login": lg, "password": pw},
+    )
+    saw_401 = False
+    saw_422 = False
+    saw_http: set[int] = set()
+    tried_fallback: list[str] = []
+
+    for body in payloads:
+        try:
+            async with session.post(f"{YANI_BASE}/profile/login", headers=headers, json=body) as resp:
+                status = resp.status
+                saw_http.add(status)
+                if status in (401, 403):
+                    saw_401 = True
+                    continue
+                if status == 422:
+                    saw_422 = True
+                    continue
+                try:
+                    data: Any = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    data = None
+                if status in (200, 201):
+                    inner = data.get("response") if isinstance(data, dict) else None
+                    if isinstance(inner, dict) and inner.get("success") is False:
+                        err = inner.get("error") or inner.get("message")
+                        if isinstance(err, str) and err.strip():
+                            return None, err.strip()
+                    tok = await _token_from_login_response(
+                        session, app_token, user_agent, resp, data
+                    )
+                    if tok:
+                        return tok, None
+                    if _cookie_header_from_response(resp):
+                        tried_fallback.extend(["/users/token", "/profile/token"])
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning("YANI login request failed /profile/login: %s", e)
+
+    if saw_401 or saw_422:
+        return None, "Неверный логин или пароль."
+    if saw_http == {404}:
+        return None, "Login endpoint `/profile/login` не найден в API."
+    if 200 in saw_http or 201 in saw_http:
+        suffix = f" (fallback: {', '.join(tried_fallback)})" if tried_fallback else ""
+        return None, (
+            "API вернул успешный ответ, но без токена"
+            f"{suffix}. Попробуйте Bearer-токен: `/yummy bind bearer_token:...`"
+        )
+    if saw_http:
+        return None, f"Не удалось авторизоваться в API YummyAnime (HTTP {sorted(saw_http)[0]})."
+    return None, "API YummyAnime login endpoint недоступен."
 
 
 async def yani_refresh_access_token(
