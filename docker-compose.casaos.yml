@@ -1,18 +1,14 @@
-# CasaOS Custom Install — только pull образа (без build).
-# Образ публикуется GitHub Actions в GHCR:
-#   ghcr.io/wuttashi1/animewutshybot:latest
-#
-# Перед установкой на хосте CasaOS (один раз), если пакет приватный:
-#   echo ghp_ВАШ_ТОКЕН | docker login ghcr.io -u ВАШ_ЛОГИН --password-stdin
-# PAT scopes: read:packages (+ repo, если пакет привязан к приватному репо)
-
+version: "3.8"
 services:
-  anime-bot:
-    image: ghcr.io/wuttashi1/animewutshybot:latest
+  animewutshybot:
+    image: python:3.12-slim-bookworm
     container_name: animewutshybot
     restart: unless-stopped
-    pull_policy: always
+    working_dir: /app
     environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: utf-8
+      LANG: C.UTF-8
       DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
       DISCORD_GUILD_ID: "1039083119250264085"
       YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
@@ -20,9 +16,27 @@ services:
       DISCORD_MESSAGE_CONTENT_INTENT: "0"
       YUMMY_SYNC_INTERVAL_SEC: "600"
     volumes:
-      - /DATA/AppData/animewutshybot/data:/app/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - /DATA/AppData/animewutshybot:/app
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ ! -f /app/.installed ]; then
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          rm -rf /tmp/animebot
+          # Замените GITHUB_PAT на свой токен (classic: repo) — приватный репозиторий
+          git clone --depth 1 --branch cursor/docker-casaos-c91d \
+            https://x-access-token:GITHUB_PAT@github.com/wuttashi1/animewutshybot.git \
+            /tmp/animebot
+          cp -a /tmp/animebot/. /app/
+          rm -rf /tmp/animebot /app/.git
+          pip install --no-cache-dir -U pip
+          pip install --no-cache-dir -r /app/requirements.txt
+          mkdir -p /app/data
+          touch /app/.installed
+        fi
+        mkdir -p /app/data
+        exec python -u /app/bot.py

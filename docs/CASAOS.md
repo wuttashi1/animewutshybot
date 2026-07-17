@@ -1,77 +1,32 @@
-# Установка бота на CasaOS с GitHub
+# CasaOS — установка через Custom Install
 
-Ошибка `No such image: animewutshybot:latest` значит: CasaOS пытается
-**скачать** образ, а не собрать его. Локального тега на Docker Hub нет.
+Используйте файл **`docker-compose.casaos.yml`** (формат как у FunPay Cardinal):
+базовый образ `python:3.12-slim-bookworm`, при первом старте `git clone` с GitHub.
 
-Ниже два рабочих пути.
+## 1. GitHub PAT
 
----
+1. GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. Generate → scope ✅ **`repo`**
+3. Скопируйте `ghp_...` или `github_pat_...`
 
-## Способ 1 — SSH / Terminal (работает сразу)
+## 2. Установка в CasaOS
 
-```bash
-cd /DATA/AppData
-git clone https://ВАШ_ЛОГИН:ghp_ТОКЕН@github.com/wuttashi1/animewutshybot.git
-cd animewutshybot
-git checkout cursor/docker-casaos-c91d
+1. Откройте `docker-compose.casaos.yml`
+2. Замените **`GITHUB_PAT`** на свой токен
+3. CasaOS → App Store → Custom Install → Docker Compose
+4. Вставьте YAML → Install
 
-mkdir -p data
-docker compose up -d --build
-docker compose logs -f
-```
+Первый запуск дольше (clone + `pip install`). Дальше контейнер просто стартует `bot.py`.
 
-Обновление:
+## 3. Обновить код с GitHub
 
 ```bash
-cd /DATA/AppData/animewutshybot
-git pull
-docker compose up -d --build
+rm /DATA/AppData/animewutshybot/.installed
+docker restart animewutshybot
 ```
 
----
+Данные бота (`data/mal_state.json` и т.д.) останутся в `/DATA/AppData/animewutshybot/data`.
 
-## Способ 2 — CasaOS UI + образ из GHCR
-
-CasaOS Custom Install умеет **pull**, а не `docker build`. Поэтому образ
-собирается в GitHub Actions и лежит в:
-
-`ghcr.io/wuttashi1/animewutshybot:latest`
-
-### 1) Дождаться сборки образа
-
-1. Откройте репозиторий → вкладка **Actions**
-2. Workflow **Build and push Docker image** должен быть зелёным
-3. Packages → `animewutshybot` (или `ghcr.io/wuttashi1/animewutshybot`)
-
-Если пакет **Private**, на CasaOS один раз:
-
-```bash
-echo ghp_ВАШ_ТОКЕН | docker login ghcr.io -u ВАШ_ЛОГИН --password-stdin
-```
-
-PAT: scopes **`read:packages`** и **`repo`**.
-
-Чтобы пакет был публичным (тогда login не нужен):  
-GitHub → Packages → animewutshybot → Package settings → Change visibility → Public.
-
-### 2) Установка в CasaOS
-
-1. App Store → Custom Install → Docker Compose  
-2. Вставьте содержимое **`docker-compose.casaos.yml`**  
-3. Install  
-
-Compose тянет `ghcr.io/wuttashi1/animewutshybot:latest` — не `animewutshybot:latest`.
-
----
-
-## Токен GitHub для приватного репо
-
-1. Settings → Developer settings → Personal access tokens → Tokens (classic)  
-2. Generate → scope ✅ **`repo`** (для clone) и ✅ **`read:packages`** (для GHCR)  
-3. Скопируйте `ghp_...`
-
----
-
-## После запуска
+## 4. После запуска
 
 В Discord: **`/bot setup`** → **`/anime add`**
