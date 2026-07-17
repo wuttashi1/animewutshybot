@@ -1,15 +1,21 @@
-# Готовый compose для CasaOS Custom Install (без build).
-# Сначала на хосте один раз:
-#   cd /path/to/animewutshybot && docker compose build
-# Потом в CasaOS вставьте этот файл и подставьте токены в environment.
+# CasaOS Custom Install — сборка прямо с GitHub (без ручного clone).
+#
+# Приватный репозиторий: замените GITHUB_TOKEN на ваш PAT (scope: repo),
+# либо заранее на хосте: git config --global credential.helper store
+# и один раз git ls-remote https://github.com/wuttashi1/animewutshybot.git
+#
+# После мержа в main смените #cursor/docker-casaos-c91d → #main
 
 services:
   anime-bot:
+    build:
+      context: https://GITHUB_TOKEN@github.com/wuttashi1/animewutshybot.git#cursor/docker-casaos-c91d
+      dockerfile: Dockerfile
     image: animewutshybot:latest
     container_name: animewutshybot
     restart: unless-stopped
     environment:
-      DISCORD_BOT_TOKEN: "PASTE_TOKEN_HERE"
+      DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
       DISCORD_GUILD_ID: "1039083119250264085"
       YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
       DISCORD_BOT_OWNER_ID: "316978986926342153"

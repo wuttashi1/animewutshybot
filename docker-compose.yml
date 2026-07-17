@@ -1,10 +1,15 @@
-# YummyAnime Discord-бот — Docker / CasaOS
+# YummyAnime Discord-бот
+# Установка с GitHub (CasaOS / любой Docker-хост):
 #
-# Быстрый старт:
-#   1. Положите рядом файл .env (см. ниже)
-#   2. mkdir -p data
-#   3. docker compose up -d --build
-#   4. docker compose logs -f
+#   git clone https://github.com/wuttashi1/animewutshybot.git
+#   cd animewutshybot
+#   git checkout cursor/docker-casaos-c91d   # пока не в main
+#   mkdir -p data
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Обновление:
+#   git pull && docker compose up -d --build
 
 services:
   anime-bot:
@@ -12,8 +17,13 @@ services:
     image: animewutshybot:latest
     container_name: animewutshybot
     restart: unless-stopped
-    env_file:
-      - .env
+    environment:
+      DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
+      DISCORD_GUILD_ID: "1039083119250264085"
+      YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
+      DISCORD_BOT_OWNER_ID: "316978986926342153"
+      DISCORD_MESSAGE_CONTENT_INTENT: "0"
+      YUMMY_SYNC_INTERVAL_SEC: "600"
     volumes:
       - ./data:/app/data
     logging:
