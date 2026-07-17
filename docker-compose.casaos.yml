@@ -1,0 +1,40 @@
+version: "3.8"
+services:
+  animewutshybot:
+    image: python:3.12-slim-bookworm
+    container_name: animewutshybot
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: utf-8
+      LANG: C.UTF-8
+      DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
+      DISCORD_GUILD_ID: "1039083119250264085"
+      YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
+      DISCORD_BOT_OWNER_ID: "316978986926342153"
+      DISCORD_MESSAGE_CONTENT_INTENT: "0"
+      YUMMY_SYNC_INTERVAL_SEC: "600"
+    volumes:
+      - /DATA/AppData/animewutshybot:/app
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ ! -f /app/.installed ]; then
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          rm -rf /tmp/animebot
+          git clone --depth 1 --branch cursor/docker-casaos-c91d https://x-access-token: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@github.com/wuttashi1/animewutshybot.git /tmp/animebot
+          mkdir -p /app/data
+          cp -a /tmp/animebot/. /app/
+          rm -rf /tmp/animebot /app/.git
+          pip install --no-cache-dir -U pip
+          pip install --no-cache-dir -r /app/requirements.txt
+          mkdir -p /app/data
+          touch /app/.installed
+        fi
+        mkdir -p /app/data
+        exec python -u /app/bot.py

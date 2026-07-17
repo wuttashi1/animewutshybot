@@ -1,0 +1,31 @@
+# CasaOS: вставьте docker-compose.casaos.yml в Custom Install
+#
+# Перед установкой замените в файле:
+#   GITHUB_PAT  → ваш GitHub token (classic, scope: repo)
+#
+# Обновление кода с GitHub:
+#   rm /DATA/AppData/animewutshybot/.installed
+#   docker restart animewutshybot
+#
+# Локальный запуск (не CasaOS): docker compose up -d --build
+
+services:
+  anime-bot:
+    build: .
+    image: animewutshybot:local
+    container_name: animewutshybot
+    restart: unless-stopped
+    environment:
+      DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
+      DISCORD_GUILD_ID: "1039083119250264085"
+      YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
+      DISCORD_BOT_OWNER_ID: "316978986926342153"
+      DISCORD_MESSAGE_CONTENT_INTENT: "0"
+      YUMMY_SYNC_INTERVAL_SEC: "600"
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
