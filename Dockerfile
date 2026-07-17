@@ -22,12 +22,9 @@ COPY bot.py \
      ./
 COPY scripts/ ./scripts/
 
-RUN mkdir -p /app/data \
-    && useradd --create-home --uid 1000 bot \
-    && chown -R bot:bot /app
+RUN mkdir -p /app/data
 
-USER bot
-
+# root — проще на CasaOS с внешним volume ./data (иначе bot:1000 не сможет писать)
 VOLUME ["/app/data"]
 
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "bot.py"]

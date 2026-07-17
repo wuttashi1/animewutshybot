@@ -1,5 +1,7 @@
-# Пример для CasaOS Custom Install (после локального `docker compose build`)
-# Volume указывает в стандартный AppData CasaOS.
+# Готовый compose для CasaOS Custom Install (без build).
+# Сначала на хосте один раз:
+#   cd /path/to/animewutshybot && docker compose build
+# Потом в CasaOS вставьте этот файл и подставьте токены в environment.
 
 services:
   anime-bot:
@@ -7,12 +9,16 @@ services:
     container_name: animewutshybot
     restart: unless-stopped
     environment:
-      DISCORD_BOT_TOKEN: REPLACE_ME
-      DISCORD_GUILD_ID: ""
-      DISCORD_BOT_OWNER_ID: ""
-      YUMMY_APPLICATION_TOKEN: ""
-      DISCORD_ADMIN_ROLE_ID: ""
+      DISCORD_BOT_TOKEN: "PASTE_TOKEN_HERE"
+      DISCORD_GUILD_ID: "1039083119250264085"
+      YUMMY_APPLICATION_TOKEN: "Sisf4i6dh12hef_2"
+      DISCORD_BOT_OWNER_ID: "316978986926342153"
       DISCORD_MESSAGE_CONTENT_INTENT: "0"
       YUMMY_SYNC_INTERVAL_SEC: "600"
     volumes:
       - /DATA/AppData/animewutshybot/data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

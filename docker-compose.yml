@@ -1,6 +1,10 @@
-# Discord-бот YummyAnime для Docker / CasaOS
-# 1. Скопируйте .env.example → .env и заполните токены
-# 2. docker compose up -d --build
+# YummyAnime Discord-бот — Docker / CasaOS
+#
+# Быстрый старт:
+#   1. Положите рядом файл .env (см. ниже)
+#   2. mkdir -p data
+#   3. docker compose up -d --build
+#   4. docker compose logs -f
 
 services:
   anime-bot:
@@ -10,22 +14,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      # Переопределения через CasaOS/UI при желании
-      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
-      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
-      DISCORD_BOT_OWNER_ID: ${DISCORD_BOT_OWNER_ID:-}
-      YUMMY_APPLICATION_TOKEN: ${YUMMY_APPLICATION_TOKEN:-}
-      DISCORD_ADMIN_ROLE_ID: ${DISCORD_ADMIN_ROLE_ID:-}
-      DISCORD_MESSAGE_CONTENT_INTENT: ${DISCORD_MESSAGE_CONTENT_INTENT:-0}
-      YUMMY_SYNC_INTERVAL_SEC: ${YUMMY_SYNC_INTERVAL_SEC:-600}
     volumes:
-      # Состояние бота (каталог, списки, привязки) — не теряется при пересоздании контейнера
       - ./data:/app/data
-    # Сеть не нужна наружу: бот сам ходит в Discord / API
-    networks:
-      - bot-net
-
-networks:
-  bot-net:
-    driver: bridge
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
