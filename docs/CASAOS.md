@@ -1,24 +1,17 @@
-# Установка бота с GitHub на CasaOS
+# Установка бота на CasaOS с GitHub
 
-Репозиторий приватный: для `git clone` / сборки нужен GitHub PAT.
+Ошибка `No such image: animewutshybot:latest` значит: CasaOS пытается
+**скачать** образ, а не собрать его. Локального тега на Docker Hub нет.
 
----
-
-## 1. Токен GitHub (чтобы тянуть приватный репо)
-
-1. GitHub → **Settings** → **Developer settings** → **Personal access tokens** → **Tokens (classic)**
-2. **Generate new token (classic)**
-3. Scope: ✅ **`repo`**
-4. Скопируйте `ghp_...`
+Ниже два рабочих пути.
 
 ---
 
-## 2. Рекомендуемый способ: clone с GitHub → compose
+## Способ 1 — SSH / Terminal (работает сразу)
 
 ```bash
-mkdir -p /DATA/AppData && cd /DATA/AppData
-
-git clone https://ВАШ_ЛОГИН:ghp_ВАШ_ТОКЕН@github.com/wuttashi1/animewutshybot.git
+cd /DATA/AppData
+git clone https://ВАШ_ЛОГИН:ghp_ТОКЕН@github.com/wuttashi1/animewutshybot.git
 cd animewutshybot
 git checkout cursor/docker-casaos-c91d
 
@@ -27,9 +20,7 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Переменные бота уже в `docker-compose.yml` — отдельный `.env` не нужен.
-
-### Обновление с GitHub
+Обновление:
 
 ```bash
 cd /DATA/AppData/animewutshybot
@@ -39,30 +30,48 @@ docker compose up -d --build
 
 ---
 
-## 3. Альтернатива: CasaOS UI без clone
+## Способ 2 — CasaOS UI + образ из GHCR
 
-1. CasaOS → **App Store** → **Custom Install** → Docker Compose
-2. Вставьте `docker-compose.casaos.yml` из репозитория
-3. В `build.context` замените `GITHUB_TOKEN` на ваш PAT
-4. Volume уже: `/DATA/AppData/animewutshybot/data:/app/data`
-5. Install
+CasaOS Custom Install умеет **pull**, а не `docker build`. Поэтому образ
+собирается в GitHub Actions и лежит в:
 
----
+`ghcr.io/wuttashi1/animewutshybot:latest`
 
-## 4. После запуска
+### 1) Дождаться сборки образа
 
-В Discord: **`/bot setup`** → **`/bot status`** → **`/anime add`**
+1. Откройте репозиторий → вкладка **Actions**
+2. Workflow **Build and push Docker image** должен быть зелёным
+3. Packages → `animewutshybot` (или `ghcr.io/wuttashi1/animewutshybot`)
 
----
-
-## 5. Если не собирается с приватного GitHub
-
-На хосте один раз:
+Если пакет **Private**, на CasaOS один раз:
 
 ```bash
-git config --global credential.helper store
-git ls-remote https://ВАШ_ЛОГИН:ghp_ТОКЕН@github.com/wuttashi1/animewutshybot.git
+echo ghp_ВАШ_ТОКЕН | docker login ghcr.io -u ВАШ_ЛОГИН --password-stdin
 ```
 
-Либо в URL compose:  
-`https://ghp_ТОКЕН@github.com/wuttashi1/animewutshybot.git#cursor/docker-casaos-c91d`
+PAT: scopes **`read:packages`** и **`repo`**.
+
+Чтобы пакет был публичным (тогда login не нужен):  
+GitHub → Packages → animewutshybot → Package settings → Change visibility → Public.
+
+### 2) Установка в CasaOS
+
+1. App Store → Custom Install → Docker Compose  
+2. Вставьте содержимое **`docker-compose.casaos.yml`**  
+3. Install  
+
+Compose тянет `ghcr.io/wuttashi1/animewutshybot:latest` — не `animewutshybot:latest`.
+
+---
+
+## Токен GitHub для приватного репо
+
+1. Settings → Developer settings → Personal access tokens → Tokens (classic)  
+2. Generate → scope ✅ **`repo`** (для clone) и ✅ **`read:packages`** (для GHCR)  
+3. Скопируйте `ghp_...`
+
+---
+
+## После запуска
+
+В Discord: **`/bot setup`** → **`/anime add`**

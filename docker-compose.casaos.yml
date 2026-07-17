@@ -1,19 +1,17 @@
-# CasaOS Custom Install — сборка прямо с GitHub (без ручного clone).
+# CasaOS Custom Install — только pull образа (без build).
+# Образ публикуется GitHub Actions в GHCR:
+#   ghcr.io/wuttashi1/animewutshybot:latest
 #
-# Приватный репозиторий: замените GITHUB_TOKEN на ваш PAT (scope: repo),
-# либо заранее на хосте: git config --global credential.helper store
-# и один раз git ls-remote https://github.com/wuttashi1/animewutshybot.git
-#
-# После мержа в main смените #cursor/docker-casaos-c91d → #main
+# Перед установкой на хосте CasaOS (один раз), если пакет приватный:
+#   echo ghp_ВАШ_ТОКЕН | docker login ghcr.io -u ВАШ_ЛОГИН --password-stdin
+# PAT scopes: read:packages (+ repo, если пакет привязан к приватному репо)
 
 services:
   anime-bot:
-    build:
-      context: https://GITHUB_TOKEN@github.com/wuttashi1/animewutshybot.git#cursor/docker-casaos-c91d
-      dockerfile: Dockerfile
-    image: animewutshybot:latest
+    image: ghcr.io/wuttashi1/animewutshybot:latest
     container_name: animewutshybot
     restart: unless-stopped
+    pull_policy: always
     environment:
       DISCORD_BOT_TOKEN: "MTQ3Mjc0ODkzNzk1Mjc1NTk0MA.GpGemF.Jx31VBOQAisFq8OTu2vZYyLMho-HGE3RrCbpdk"
       DISCORD_GUILD_ID: "1039083119250264085"

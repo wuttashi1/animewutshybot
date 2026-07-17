@@ -1,20 +1,17 @@
 # YummyAnime Discord-бот
-# Установка с GitHub (CasaOS / любой Docker-хост):
 #
+# Способ A — clone с GitHub и локальная сборка (работает сразу):
 #   git clone https://github.com/wuttashi1/animewutshybot.git
-#   cd animewutshybot
-#   git checkout cursor/docker-casaos-c91d   # пока не в main
-#   mkdir -p data
-#   docker compose up -d --build
-#   docker compose logs -f
+#   cd animewutshybot && git checkout cursor/docker-casaos-c91d
+#   mkdir -p data && docker compose up -d --build
 #
-# Обновление:
-#   git pull && docker compose up -d --build
+# Способ B — CasaOS UI: используйте docker-compose.casaos.yml
+#   (образ ghcr.io/wuttashi1/animewutshybot:latest после CI)
 
 services:
   anime-bot:
     build: .
-    image: animewutshybot:latest
+    image: ghcr.io/wuttashi1/animewutshybot:latest
     container_name: animewutshybot
     restart: unless-stopped
     environment:
