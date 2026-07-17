@@ -1,0 +1,18 @@
+# Пример для CasaOS Custom Install (после локального `docker compose build`)
+# Volume указывает в стандартный AppData CasaOS.
+
+services:
+  anime-bot:
+    image: animewutshybot:latest
+    container_name: animewutshybot
+    restart: unless-stopped
+    environment:
+      DISCORD_BOT_TOKEN: REPLACE_ME
+      DISCORD_GUILD_ID: ""
+      DISCORD_BOT_OWNER_ID: ""
+      YUMMY_APPLICATION_TOKEN: ""
+      DISCORD_ADMIN_ROLE_ID: ""
+      DISCORD_MESSAGE_CONTENT_INTENT: "0"
+      YUMMY_SYNC_INTERVAL_SEC: "600"
+    volumes:
+      - /DATA/AppData/animewutshybot/data:/app/data
