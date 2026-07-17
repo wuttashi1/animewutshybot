@@ -15,6 +15,8 @@ services:
       DISCORD_BOT_OWNER_ID: "316978986926342153"
       DISCORD_MESSAGE_CONTENT_INTENT: "0"
       YUMMY_SYNC_INTERVAL_SEC: "600"
+      # Вставьте сюда свой GitHub PAT (classic, scope: repo)
+      GITHUB_PAT: "REPLACE_WITH_YOUR_GITHUB_PAT"
     volumes:
       - /DATA/AppData/animewutshybot:/app
     command:
@@ -22,21 +24,56 @@ services:
       - -c
       - |
         set -eu
+        log() { echo "[animebot] $$1"; }
+        fail() { log "ERROR: $$1"; log "Смотрите: docker logs animewutshybot"; sleep 120; exit 1; }
+
         if [ ! -f /app/.installed ]; then
+          log "Первая установка…"
+          case "$${GITHUB_PAT:-}" in
+            ""|"REPLACE_WITH_YOUR_GITHUB_PAT"|"GITHUB_PAT")
+              fail "Не задан GITHUB_PAT в environment. Вставьте свой токен GitHub (repo)."
+              ;;
+          esac
+
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
           rm -rf /var/lib/apt/lists/*
+
           rm -rf /tmp/animebot
-          # Замените GITHUB_PAT на свой токен (classic: repo) — приватный репозиторий
-          git clone --depth 1 --branch cursor/docker-casaos-c91d \
-            https://x-access-token:GITHUB_PAT@github.com/wuttashi1/animewutshybot.git \
-            /tmp/animebot
+          log "git clone wuttashi1/animewutshybot (ветка cursor/docker-casaos-c91d)…"
+          if ! git clone --depth 1 --branch cursor/docker-casaos-c91d \
+              "https://x-access-token:$${GITHUB_PAT}@github.com/wuttashi1/animewutshybot.git" \
+              /tmp/animebot; then
+            fail "git clone не удался (проверьте PAT и доступ к приватному репо)."
+          fi
+
+          # Не затираем уже существующие данные бота
+          mkdir -p /app/data
+          if [ -d /app/data ] && [ "$(ls -A /app/data 2>/dev/null || true)" != "" ]; then
+            cp -a /app/data /tmp/animebot-data-backup
+          fi
+          find /app -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} +
           cp -a /tmp/animebot/. /app/
+          if [ -d /tmp/animebot-data-backup ]; then
+            rm -rf /app/data
+            mv /tmp/animebot-data-backup /app/data
+          fi
           rm -rf /tmp/animebot /app/.git
+
+          test -f /app/bot.py || fail "После clone нет /app/bot.py"
+          test -f /app/requirements.txt || fail "После clone нет /app/requirements.txt"
+
+          log "pip install…"
           pip install --no-cache-dir -U pip
           pip install --no-cache-dir -r /app/requirements.txt
+
           mkdir -p /app/data
           touch /app/.installed
+          log "Установка завершена."
         fi
-        mkdir -p /app/data
+
+        test -f /app/bot.py || fail "Нет /app/bot.py — удалите /DATA/AppData/animewutshybot/.installed и перезапустите"
+        test -n "$${DISCORD_BOT_TOKEN:-}" || fail "Пустой DISCORD_BOT_TOKEN"
+
+        log "Запуск bot.py…"
         exec python -u /app/bot.py
