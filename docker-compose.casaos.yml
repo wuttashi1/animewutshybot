@@ -22,50 +22,19 @@ services:
       - -c
       - |
         set -eu
-        trap 'echo "[animebot] ОШИБКА (строка $$LINENO). Логи: docker logs animewutshybot"; sleep 120' EXIT
-
-        echo "[animebot] старт entrypoint"
-
         if [ ! -f /app/.installed ]; then
-          echo "[animebot] первая установка…"
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
           rm -rf /var/lib/apt/lists/*
           rm -rf /tmp/animebot
-
-          # !!! Вставьте свой GitHub PAT вместо REPLACE_ME_GITHUB_PAT (classic → scope repo)
-          git clone --depth 1 --branch cursor/docker-casaos-c91d \
-            https://x-access-token:REPLACE_ME_GITHUB_PAT@github.com/wuttashi1/animewutshybot.git \
-            /tmp/animebot
-
+          git clone --depth 1 --branch cursor/docker-casaos-c91d https://x-access-token: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@github.com/wuttashi1/animewutshybot.git /tmp/animebot
           mkdir -p /app/data
           cp -a /tmp/animebot/. /app/
           rm -rf /tmp/animebot /app/.git
-
-          if [ ! -f /app/bot.py ]; then
-            echo "[animebot] нет bot.py после clone"
-            exit 1
-          fi
-
-          echo "[animebot] pip install…"
           pip install --no-cache-dir -U pip
           pip install --no-cache-dir -r /app/requirements.txt
-
           mkdir -p /app/data
           touch /app/.installed
-          echo "[animebot] установка OK"
         fi
-
-        if [ ! -f /app/bot.py ]; then
-          echo "[animebot] нет /app/bot.py — выполните: rm /DATA/AppData/animewutshybot/.installed && docker restart animewutshybot"
-          exit 1
-        fi
-
-        if [ -z "$${DISCORD_BOT_TOKEN:-}" ]; then
-          echo "[animebot] пустой DISCORD_BOT_TOKEN"
-          exit 1
-        fi
-
-        echo "[animebot] запуск python bot.py…"
-        trap - EXIT
+        mkdir -p /app/data
         exec python -u /app/bot.py
