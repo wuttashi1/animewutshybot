@@ -2,38 +2,38 @@
 
 # Anime Wutshy Bot
 
-Discord-бот для аниме-сообщества: карточки аниме, форумные темы, личные списки и интеграция с YummyAnime.
+Discord anime community bot with anime cards, forum topics, personal lists and YummyAnime integration.
 
-[Правила разработки](CONTRIBUTING.md) · [Ветки](https://github.com/wuttashi1/animewutshybot/branches)
+[Contributing](CONTRIBUTING.md) · [Branches](https://github.com/wuttashi1/animewutshybot/branches)
 
 </div>
 
 ---
 
-## Возможности
+## Features
 
-- Карточки аниме с данными внешних API.
-- Работа с форумными темами и личными аниме-списками.
-- Панель администратора, обновление тем и поиск дубликатов.
-- Интеграция с YummyAnime и получение данных через Jikan.
+- Anime cards backed by external APIs.
+- Forum topics and personal anime lists.
+- Administrative panels, topic updates and duplicate detection.
+- YummyAnime integration and Jikan data fetching.
 
-## Запуск
+## Quick start
+
+Create and activate a Python virtual environment, then:
 
 ```bash
-python -m venv .venv
-# Активируйте .venv для вашей оболочки
 python -m pip install -r requirements.txt
 python bot.py
 ```
 
-Перед запуском настройте локальный `.env` по `.env.example`. Бот читает `DISCORD_BOT_TOKEN`; набор параметров интеграций смотрите в примере конфигурации. Настройте приложение и разрешения бота в Discord Developer Portal.
+Before starting, configure a local `.env` using `.env.example`. The bot reads `DISCORD_BOT_TOKEN`; see the example configuration for integration settings. Configure the application and bot permissions in the Discord Developer Portal.
 
-## Навигация
+## Project layout
 
-- `bot.py` — команды, панели и работа с Discord.
-- `yummy_api.py` — интеграция с YummyAnime.
-- Рабочие версии и эксперименты доступны в списке веток репозитория; `main` остаётся основной веткой.
+- `bot.py` — Discord commands, panels and forum workflows.
+- `yummy_api.py` — YummyAnime integration.
+- Development versions are available in the repository's branch list. `main` remains the default branch.
 
-## Разработка
+## Development
 
-Соглашения по веткам и изменениям: [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for branch and contribution guidelines.

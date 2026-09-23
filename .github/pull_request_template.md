@@ -1,11 +1,11 @@
-## Что изменилось
+## What changed
 
-Опишите проблему и результат изменения.
+Describe the problem and resulting behavior.
 
-## Проверка
+## Validation
 
-Укажите выполненные проверки и их результат.
+List checks performed and their results.
 
-## Конфигурация и данные
+## Configuration and data
 
-Укажите новые переменные окружения, миграции или напишите «не требуется».
+Describe environment changes or migrations, or write "Not required".

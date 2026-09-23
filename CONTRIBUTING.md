@@ -1,14 +1,14 @@
-# Работа с проектом
+# Contributing
 
-## Ветки
+## Branch workflow
 
-- `main` — основная версия проекта.
-- `feat/<short-name>` — отдельная новая функция.
-- `fix/<short-name>` — исправление ошибки.
-- `docs/<short-name>` — документация.
-- `chore/<short-name>` — зависимости и обслуживание.
+- `main` — the default integration branch.
+- `feat/<short-name>` — a specific new feature.
+- `fix/<short-name>` — a bug fix.
+- `docs/<short-name>` — documentation updates.
+- `chore/<short-name>` — dependencies and maintenance.
 
-Создавайте ветку под конкретную задачу от актуальной `main`:
+Start each task from the latest `main`:
 
 ```bash
 git switch main
@@ -16,13 +16,13 @@ git pull --ff-only
 git switch -c feat/short-name
 ```
 
-Открывайте pull request в `main`. Опишите результат, способ проверки и изменения конфигурации. После слияния удаляйте завершённую рабочую ветку. Существующие ветки с незавершённой работой сохраняйте до проверки и переноса изменений.
+Open a pull request targeting `main`. Explain the resulting behavior, validation and configuration changes. Delete completed branches after merging. Preserve existing work branches until their changes have been reviewed and integrated.
 
-## Перед отправкой
+## Before submitting
 
-- Проверьте diff и запуск затронутого компонента.
-- Не добавляйте токены, `.env`, базы с пользовательскими данными и журналы.
-- Для новых параметров обновляйте пример конфигурации без действующих секретов.
-- Обновляйте README, если меняются запуск или возможности.
+- Review the diff and check the affected component.
+- Keep tokens, `.env` files, user databases and logs out of commits.
+- Document new configuration variables with placeholder values.
+- Update the README when setup or features change.
 
-Рекомендуемые сообщения коммитов: `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`.
+Suggested commit prefixes: `feat:`, `fix:`, `docs:` and `chore:`.
