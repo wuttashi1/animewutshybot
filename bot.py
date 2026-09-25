@@ -47,7 +47,7 @@ USER_AGENT = (
 )
 
 ITEM_PATH_RE = re.compile(
-    r"(?:https?://)?(?:en\.)?yummyani\.me/catalog/item/([^/?#\s]+)", re.I
+    r"(?:https?://)?(?:en\.)?yummyani\.me/catalog/item/([^/?#\s<>\[\]()`\"']+)", re.I
 )
 DATE_SUFFIX_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 
@@ -4160,8 +4160,8 @@ async def run_animelist_discord_topics(
         return (
             None,
             f"{target.mention} — в личном списке пока нет записей. "
-            "Они появляются при добавлении аниме в основной форум (`/addanime`). "
-            "Если вы уже добавляли раньше, админ может выполнить `/syncmylist` для вашего профиля.",
+            "Они появляются при добавлении аниме в основной форум (`/anime add`). "
+            "Если вы уже добавляли раньше, админ может выполнить `/admin sync_list` для вашего профиля.",
             0,
             0,
         )
@@ -4174,7 +4174,7 @@ async def run_animelist_discord_topics(
         description=_truncate(body, EMBED_DESC_LIMIT),
         color=EMBED_COLOR,
     )
-    embed.set_footer(text="Данные из личной темы списков · команда /checkanime")
+    embed.set_footer(text="Данные из личной темы списков · команда /list show")
     return embed, None, len(pairs), 0
 
 

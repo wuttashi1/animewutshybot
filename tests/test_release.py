@@ -265,6 +265,12 @@ class APITests(unittest.IsolatedAsyncioTestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_discord_link_wrappers_do_not_become_catalog_keys(self):
+        url = 'https://en.yummyani.me/catalog/item/naruto'
+        for text in (url, f'<{url}>', f'[Naruto]({url})', f'`{url}`'):
+            with self.subTest(text=text):
+                self.assertEqual(bot._topic_key_from_starter_text(text), ('naruto', 'yummy', url))
+
     def test_owner_requires_id_not_matching_name(self):
         with patch.dict(os.environ,{'DISCORD_BOT_OWNER_ID':'123'}):
             self.assertFalse(bot.is_bot_owner(SimpleNamespace(id=999,name=bot.BOT_OWNER_USERNAME)))

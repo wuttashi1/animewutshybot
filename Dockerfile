@@ -29,4 +29,5 @@ RUN mkdir -p /app/data
 # root — проще на CasaOS с внешним volume ./data (иначе bot:1000 не сможет писать)
 VOLUME ["/app/data"]
 
+STOPSIGNAL SIGINT
 CMD ["python", "-u", "bot.py"]
