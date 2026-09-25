@@ -8,6 +8,7 @@ from typing import Any, Callable, Awaitable
 
 import aiohttp
 import discord
+from thread_utils import ensure_thread_writable
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,7 @@ async def rebuild_display(
             return
     if not isinstance(thread, discord.Thread):
         return
+    thread = await ensure_thread_writable(thread)
 
     mode = normalize_display_mode(pl.get("display_mode"))
     if skip_deferred and pl.get("ui_deferred"):

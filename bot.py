@@ -30,6 +30,7 @@ import roaster
 import roaster_automation
 import yummy_api
 from http_client import get_json
+from thread_utils import ensure_thread_writable
 from dotenv import load_dotenv
 from discord import app_commands
 from discord.ext import commands
@@ -1283,6 +1284,7 @@ async def merge_adder_into_existing_topic(
         body = build_message_content(page_url, new_adders, notes_str)
 
     try:
+        thread = await ensure_thread_writable(thread)
         await starter.edit(
             content=_truncate(body, DISCORD_CONTENT_LIMIT),
             embeds=starter.embeds,
@@ -3432,9 +3434,11 @@ class AnimeRatingModal(discord.ui.Modal, title="Оценка аниме"):
 
 
 class RateAnimePanelView(discord.ui.View):
-    def __init__(self, *, thread_id: int) -> None:
+    def __init__(self, *, thread_id: int, custom_id: str | None = None) -> None:
         super().__init__(timeout=None)
         self.thread_id = thread_id
+        if custom_id:
+            self.children[0].custom_id = custom_id
 
     @discord.ui.button(
         label="Оценить",
@@ -3474,9 +3478,10 @@ async def refresh_rating_panel(client: discord.Client, thread_id: int) -> None:
             return
     if not isinstance(thread, discord.Thread):
         return
+    thread = await ensure_thread_writable(thread)
     guild = thread.guild
     embed = _build_rating_panel_embed(state, thread_id, guild)
-    view = RateAnimePanelView(thread_id=thread_id)
+    view = RateAnimePanelView(thread_id=thread_id, custom_id=state.get("threads", {}).get(str(thread_id), {}).get("rating_message_id_custom_id"))
     tid_s = str(thread_id)
     slot = state.get("threads", {}).get(tid_s, {})
     msg_id: int | None = None
@@ -3504,9 +3509,11 @@ _recommend_cooldowns: dict[tuple[int, int], float] = {}
 
 
 class RecommendPanelView(discord.ui.View):
-    def __init__(self, *, thread_id: int) -> None:
+    def __init__(self, *, thread_id: int, custom_id: str | None = None) -> None:
         super().__init__(timeout=None)
         self.thread_id = thread_id
+        if custom_id:
+            self.children[0].custom_id = custom_id
 
     @discord.ui.select(
         cls=discord.ui.UserSelect,
@@ -3542,6 +3549,7 @@ class RecommendPanelView(discord.ui.View):
             f"аниме **{anime_title}**."
         )
         await interaction.response.defer(ephemeral=True)
+        ch = await ensure_thread_writable(ch)
         await ch.send(
             line,
             allowed_mentions=discord.AllowedMentions(users=[target], roles=False, everyone=False),
@@ -3564,12 +3572,13 @@ async def refresh_recommend_panel(client: discord.Client, thread_id: int) -> Non
             return
     if not isinstance(thread, discord.Thread):
         return
+    thread = await ensure_thread_writable(thread)
     embed = discord.Embed(
         title=RECOMMEND_PANEL_TITLE,
         description=RECOMMEND_PANEL_DESC,
         color=0x9B59B6,
     )
-    view = RecommendPanelView(thread_id=thread_id)
+    view = RecommendPanelView(thread_id=thread_id, custom_id=state.get("threads", {}).get(str(thread_id), {}).get("recommend_message_id_custom_id"))
     tid_s = str(thread_id)
     slot = state.get("threads", {}).get(tid_s, {})
     msg_id: int | None = None
@@ -3683,6 +3692,7 @@ async def refresh_add_to_list_panel(client: discord.Client, thread_id: int) -> N
             return
     if not isinstance(thread, discord.Thread):
         return
+    thread = await ensure_thread_writable(thread)
     embed = discord.Embed(
         title="📥 Личный список",
         description="Нажмите кнопку ниже, чтобы добавить это аниме в ваш личный список.",
@@ -3966,7 +3976,7 @@ class YummyBot(commands.Bot):
             for field, cls in (("rating_message_id", RateAnimePanelView),
                                ("recommend_message_id", RecommendPanelView)):
                 if slot.get(field):
-                    self.add_view(cls(thread_id=int(tid)), message_id=int(slot[field]))
+                    self.add_view(cls(thread_id=int(tid), custom_id=slot.get(field+"_custom_id")), message_id=int(slot[field]))
         guild_id = (os.environ.get("DISCORD_GUILD_ID") or "").strip()
 
         if guild_id:
@@ -4171,12 +4181,13 @@ async def run_animelist_discord_topics(
 async def restore_legacy_topic_panels(client):
     state = await read_state_copy()
     for tid, slot in state.get("threads", {}).items():
-        if not isinstance(slot, dict) or slot.get("persistent_panels_version") == 1:
+        if not isinstance(slot, dict) or slot.get("persistent_panels_version") == 2:
             continue
         try:
             channel = client.get_channel(int(tid)) or await client.fetch_channel(int(tid))
             if not isinstance(channel, discord.Thread):
                 continue
+            recovered = {}
             for field, cls in (("rating_message_id", RateAnimePanelView),
                                ("recommend_message_id", RecommendPanelView)):
                 if not slot.get(field):
@@ -4187,14 +4198,19 @@ async def restore_legacy_topic_panels(client):
                     continue
                 if message.author.id != client.user.id:
                     continue
-                view = cls(thread_id=int(tid))
-                await message.edit(view=view)
+                custom_ids = [child.custom_id for row in message.components
+                              for child in row.children if getattr(child, "custom_id", None)]
+                if len(custom_ids) != 1:
+                    continue
+                view = cls(thread_id=int(tid), custom_id=custom_ids[0])
                 client.add_view(view, message_id=message.id)
+                recovered[field+"_custom_id"] = custom_ids[0]
             async with _state_lock:
                 data = _load_state()
                 current = data.get("threads", {}).get(str(tid))
                 if isinstance(current, dict):
-                    current["persistent_panels_version"] = 1
+                    current.update(recovered)
+                    current["persistent_panels_version"] = 2
                     _write_state(data)
         except (discord.HTTPException, ValueError, TypeError):
             logger.warning("Could not restore saved panels for thread %s", tid)

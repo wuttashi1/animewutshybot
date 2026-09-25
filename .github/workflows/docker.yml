@@ -13,6 +13,7 @@ on:
       - register_commands.py
       - roaster.py
       - roaster_automation.py
+      - thread_utils.py
       - http_client.py
       - yummy_api.py
       - scripts/**

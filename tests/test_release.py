@@ -30,7 +30,7 @@ class DisplayTests(unittest.IsolatedAsyncioTestCase):
         self.pl = {'thread_id': 10, 'keys': ['a', 'b'], 'display_mode': 'summary', 'recent_keys': ['b']}
         self.state = {'personal_lists': {'1': {'2': self.pl}}}
         self.messages = {}
-        self.thread = SimpleNamespace(fetch_message=AsyncMock(side_effect=self.fetch),
+        self.thread = SimpleNamespace(archived=False, locked=False, fetch_message=AsyncMock(side_effect=self.fetch),
                                       send=AsyncMock(side_effect=self.send))
         self.client = SimpleNamespace(get_guild=lambda _: SimpleNamespace(get_member=lambda _: SimpleNamespace(display_name='Name')),
                                       get_channel=lambda _: self.thread)
@@ -146,18 +146,32 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(error)
         create.assert_not_awaited()
 
-    async def test_restore_old_buttons_edits_once_without_sending(self):
+    async def test_restore_archived_buttons_without_editing_or_sending(self):
         state={'threads':{'21':{'rating_message_id':30,'recommend_message_id':31}}}
-        messages={mid:SimpleNamespace(id=mid,author=SimpleNamespace(id=99),edit=AsyncMock()) for mid in (30,31)}
+        messages={mid:SimpleNamespace(id=mid,author=SimpleNamespace(id=99),components=[SimpleNamespace(children=[SimpleNamespace(custom_id='old-'+str(mid))])],edit=AsyncMock()) for mid in (30,31)}
         channel=SimpleNamespace(fetch_message=AsyncMock(side_effect=lambda mid:messages[mid]),send=AsyncMock())
         from unittest.mock import Mock
         client=SimpleNamespace(user=SimpleNamespace(id=99),get_channel=lambda _:channel,add_view=Mock())
         with patch.object(bot,'read_state_copy',AsyncMock(return_value=state)), patch.object(bot,'_load_state',return_value=state), patch.object(bot,'_write_state'), patch.object(bot.discord,'Thread',SimpleNamespace):
             await bot.restore_legacy_topic_panels(client)
             await bot.restore_legacy_topic_panels(client)
-        for message in messages.values():message.edit.assert_awaited_once()
+        for message in messages.values():message.edit.assert_not_awaited()
         channel.send.assert_not_awaited()
-        self.assertEqual(state['threads']['21']['persistent_panels_version'],1)
+        self.assertEqual(state['threads']['21']['persistent_panels_version'],2)
+        self.assertEqual(state['threads']['21']['rating_message_id_custom_id'],'old-30')
+        self.assertEqual(client.add_view.call_args_list[0].args[0].children[0].custom_id,'old-30')
+
+    async def test_requested_write_opens_unlocked_archive(self):
+        from thread_utils import ensure_thread_writable
+        thread=SimpleNamespace(archived=True,locked=False,edit=AsyncMock())
+        await ensure_thread_writable(thread)
+        self.assertFalse(thread.edit.call_args.kwargs['archived'])
+
+    async def test_requested_write_does_not_unlock_moderated_thread(self):
+        from thread_utils import ensure_thread_writable
+        thread=SimpleNamespace(archived=True,locked=True,edit=AsyncMock())
+        self.assertIs(await ensure_thread_writable(thread),thread)
+        thread.edit.assert_not_awaited()
 
     async def test_rating_acknowledges_before_panel_request(self):
         events=[]

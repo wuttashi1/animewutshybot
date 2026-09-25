@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py \
      http_client.py \
+     thread_utils.py \
      guild_config.py \
      personal_display.py \
      register_commands.py \
