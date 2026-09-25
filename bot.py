@@ -1633,9 +1633,7 @@ def _bot_owner_ids() -> set[int]:
 
 
 def is_bot_owner(user: discord.abc.User) -> bool:
-    if user.id in _bot_owner_ids():
-        return True
-    return user.name.lower() == BOT_OWNER_USERNAME.lower()
+    return user.id in _bot_owner_ids()
 
 
 async def is_roaster_active(guild_id: int) -> bool:
@@ -2668,6 +2666,31 @@ def catalog_interaction(func):
     return run
 
 
+@serialized(lambda guild, **kwargs: guild.id)
+async def ensure_guild_setup(guild, *, category_name=guild_config.DEFAULT_CATEGORY_NAME):
+    """Repeated setup reuses the binding; inaccessible channels are never replaced."""
+    cfg = await get_guild_cfg(guild.id)
+    if cfg and (cfg.get("forum_channel_id") or cfg.get("list_forum_channel_id")):
+        for field in ("forum_channel_id", "list_forum_channel_id"):
+            cid = cfg.get(field)
+            if not cid:
+                return cfg, "Настройка неполная. Проверьте привязки каналов через /bot health."
+            try:
+                channel = guild.get_channel(int(cid)) or await guild.fetch_channel(int(cid))
+            except (discord.HTTPException, ValueError, TypeError):
+                return cfg, "Сохранённый форум недоступен. Проверьте права и ID через /bot health; новые форумы не созданы."
+            if not isinstance(channel, discord.ForumChannel) or channel.guild.id != guild.id:
+                return cfg, "Сохранённый канал не является форумом этого сервера. Проверьте /bot health."
+        return cfg, None
+    created, error = await guild_config.setup_guild_channels(
+        guild, category_name=category_name, commands_embed=_build_bot_commands_embed())
+    if error:
+        return created, error
+    merged = {**(cfg or {}), **created, "category_name": category_name}
+    await save_guild_cfg(guild.id, merged)
+    return merged, None
+
+
 @serialized(lambda client, guild_id, user_id, **kwargs: (guild_id, user_id))
 async def rebuild_personal_list_display(
     client: discord.Client,
@@ -2919,6 +2942,7 @@ async def sync_personal_list_from_anime_topics(
 
 
 @catalog_serialized
+@serialized(lambda guild, discord_user_id, **kwargs: discord_user_id)
 async def run_yummy_list_import_for_member(
     guild: discord.Guild,
     discord_user_id: int,
@@ -3375,9 +3399,15 @@ class AnimeRatingModal(discord.ui.Modal, title="Оценка аниме"):
                 "Допустимы только целые числа **от 1 до 10**.", ephemeral=True
             )
             return
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await set_user_rating(self.thread_id, interaction.user.id, n)
-        await refresh_rating_panel(interaction.client, self.thread_id)
-        await interaction.response.send_message(
+        try:
+            await refresh_rating_panel(interaction.client, self.thread_id)
+        except discord.HTTPException:
+            await interaction.followup.send(
+                f"Оценка **{n}/10** сохранена. Панель временно недоступна.", ephemeral=True)
+            return
+        await interaction.followup.send(
             f"Оценка **{n}/10** сохранена. Панель в теме обновлена.", ephemeral=True
         )
 
@@ -3411,6 +3441,7 @@ class RateAnimePanelView(discord.ui.View):
         await interaction.response.send_modal(AnimeRatingModal(self.thread_id))
 
 
+@serialized(lambda client, thread_id: thread_id)
 async def refresh_rating_panel(client: discord.Client, thread_id: int) -> None:
     state = await read_state_copy()
     if not thread_has_rating_slot(state, thread_id):
@@ -3500,6 +3531,7 @@ class RecommendPanelView(discord.ui.View):
         await interaction.followup.send("Сообщение отправлено в тему.", ephemeral=True)
 
 
+@serialized(lambda client, thread_id: thread_id)
 async def refresh_recommend_panel(client: discord.Client, thread_id: int) -> None:
     state = await read_state_copy()
     if not thread_has_rating_slot(state, thread_id):
@@ -3619,6 +3651,7 @@ class AddToMyListPanelView(discord.ui.View):
         )
 
 
+@serialized(lambda client, thread_id: thread_id)
 async def refresh_add_to_list_panel(client: discord.Client, thread_id: int) -> None:
     state = await read_state_copy()
     if not thread_has_rating_slot(state, thread_id):
@@ -4116,10 +4149,43 @@ async def run_animelist_discord_topics(
     return embed, None, len(pairs), 0
 
 
+async def restore_legacy_topic_panels(client):
+    state = await read_state_copy()
+    for tid, slot in state.get("threads", {}).items():
+        if not isinstance(slot, dict) or slot.get("persistent_panels_version") == 1:
+            continue
+        try:
+            channel = client.get_channel(int(tid)) or await client.fetch_channel(int(tid))
+            if not isinstance(channel, discord.Thread):
+                continue
+            for field, cls in (("rating_message_id", RateAnimePanelView),
+                               ("recommend_message_id", RecommendPanelView)):
+                if not slot.get(field):
+                    continue
+                try:
+                    message = await channel.fetch_message(int(slot[field]))
+                except discord.NotFound:
+                    continue
+                if message.author.id != client.user.id:
+                    continue
+                view = cls(thread_id=int(tid))
+                await message.edit(view=view)
+                client.add_view(view, message_id=message.id)
+            async with _state_lock:
+                data = _load_state()
+                current = data.get("threads", {}).get(str(tid))
+                if isinstance(current, dict):
+                    current["persistent_panels_version"] = 1
+                    _write_state(data)
+        except (discord.HTTPException, ValueError, TypeError):
+            logger.warning("Could not restore saved panels for thread %s", tid)
+
+
 @bot.event
 async def on_ready() -> None:
     assert bot.user is not None
     logger.info("Бот онлайн: %s (%s)", bot.user, bot.user.id)
+    await restore_legacy_topic_panels(bot)
     try:
         await migrate_legacy_guild_config()
     except Exception as e:

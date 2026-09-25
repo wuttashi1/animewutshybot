@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+import aiohttp
 import discord
 import guild_config
 import personal_display
@@ -902,34 +903,16 @@ def setup(bot_instance: discord.Client) -> None:
                 ephemeral=True,
             )
             return
-        cid = pl.get("control_message_id")
-        if cid:
-            try:
-                await ch.fetch_message(int(cid))
-                await interaction.response.send_message(
-                    "Панель уже на месте. Если кнопки «мёртвые», нажмите **Обновить** "
-                    "на панели или перезапустите бота.",
-                    ephemeral=True,
-                )
-                return
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
         await interaction.response.defer(ephemeral=True, thinking=True)
-        hub_embed = core._personal_hub_embed(pl, interaction.user.display_name)
         try:
-            hub_msg = await ch.send(embed=hub_embed, view=core.PersonalTopicHubView())
-        except discord.HTTPException as e:
+            await core.rebuild_personal_list_display(
+                bot_instance, interaction.guild.id, oid, session=bot_instance.session)
+        except discord.HTTPException:
             await interaction.followup.send(
-                f"Не удалось отправить панель: {e}", ephemeral=True
-            )
+                "Не удалось восстановить панель. Проверьте доступ к теме; повторные сообщения не создавались.",
+                ephemeral=True)
             return
-        await core._set_personal_list_fields(
-            interaction.guild.id, oid, control_message_id=hub_msg.id
-        )
-        await interaction.followup.send(
-            "Панель отправлена **вниз темы**. При необходимости удалите дубликат вручную.",
-            ephemeral=True,
-        )
+        await interaction.followup.send("Панель восстановлена на месте.", ephemeral=True)
 
     @list_group.command(
         name="edit",
@@ -1390,18 +1373,13 @@ def setup(bot_instance: discord.Client) -> None:
         assert interaction.guild is not None
         await interaction.response.defer(ephemeral=True, thinking=True)
         cat_name = (category_name or guild_config.DEFAULT_CATEGORY_NAME).strip()
-        cfg, err = await guild_config.setup_guild_channels(
-            interaction.guild,
-            category_name=cat_name or guild_config.DEFAULT_CATEGORY_NAME,
-            commands_embed=core._build_bot_commands_embed(),
-        )
+        cfg, err = await core.ensure_guild_setup(
+            interaction.guild, category_name=cat_name or guild_config.DEFAULT_CATEGORY_NAME)
         if err:
             await interaction.followup.send(err, ephemeral=True)
             return
-        cfg["category_name"] = cat_name or guild_config.DEFAULT_CATEGORY_NAME
-        await core.save_guild_cfg(interaction.guild.id, cfg)
         lines = [
-            f"Сервер настроен. Категория: **{cfg['category_name']}**",
+            f"Сервер настроен. Категория: **{cfg.get('category_name', cat_name)}**",
             f"**Каталог:** <#{cfg.get('forum_channel_id')}>",
             f"**Личные списки:** <#{cfg.get('list_forum_channel_id')}>",
         ]
@@ -1485,22 +1463,11 @@ def setup(bot_instance: discord.Client) -> None:
         lines.append("**YummyAnime API:**")
         try:
             session = await bot_instance.ensure_http_session()
-            async with session.get(
-                f"{core.BASE}/api/search", params={"q": "naruto"}
-            ) as resp:
-                lines.append(f"GET /api/search → HTTP {resp.status}")
-            if yummy_app:
-                async with session.post(
-                    "https://api.yani.tv/profile/login",
-                    headers=yummy_api.build_yani_headers(yummy_app, None, core.USER_AGENT),
-                    json={"login": "healthcheck", "password": "healthcheck"},
-                ) as resp:
-                    lines.append(
-                        f"POST /profile/login → HTTP {resp.status} "
-                        f"({'endpoint OK' if resp.status != 404 else 'NOT FOUND'})"
-                    )
-        except Exception as e:
-            lines.append(f"API error: {e}")
+            slug = await core.api_search_slug(session, "naruto")
+            info = await core.api_fetch_anime(session, slug) if slug else None
+            lines.append("Поиск и карточка: " + ("OK" if info else "недоступны"))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            lines.append("API временно недоступен.")
 
         cmds = bot_instance.tree.get_commands()
         cmd_names: list[str] = []
@@ -1681,13 +1648,10 @@ def setup(bot_instance: discord.Client) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         if action == "setup_channels":
-            cfg, err = await guild_config.setup_guild_channels(
-                interaction.guild, commands_embed=core._build_bot_commands_embed()
-            )
+            cfg, err = await core.ensure_guild_setup(interaction.guild)
             if err:
                 await interaction.followup.send(err, ephemeral=True)
                 return
-            await core.save_guild_cfg(interaction.guild.id, cfg)
             await interaction.followup.send(guild_config.format_guild_status(cfg), ephemeral=True)
             return
 

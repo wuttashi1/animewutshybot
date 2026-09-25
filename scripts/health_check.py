@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only API checks: no gateway session, registration or messages."""
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -25,7 +26,7 @@ async def main():
             print(f'Discord authentication: HTTP {status}')
             failed |= status != 200
             if status == 200:
-                state = bot._load_state()
+                state = json.loads(bot.STATE_PATH.read_text(encoding='utf-8')) if bot.STATE_PATH.is_file() else {}
                 for cfg in state.get('guilds', {}).values():
                     for key in ('forum_channel_id', 'list_forum_channel_id'):
                         channel = cfg.get(key)

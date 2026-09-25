@@ -116,6 +116,54 @@ class Response:
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
+    async def test_setup_twice_does_not_create_duplicate_forums(self):
+        import guild_config
+        config={}
+        guild=SimpleNamespace(id=813, get_channel=lambda cid:SimpleNamespace(guild=SimpleNamespace(id=813)))
+        async def save(gid,cfg): config.update(cfg)
+        async def read(gid): return config or None
+        create=AsyncMock(return_value=({'forum_channel_id':1,'list_forum_channel_id':2},None))
+        with patch.object(bot,'get_guild_cfg',side_effect=read), patch.object(bot,'save_guild_cfg',side_effect=save), patch.object(guild_config,'setup_guild_channels',create), patch.object(bot.discord,'ForumChannel',SimpleNamespace):
+            first=await bot.ensure_guild_setup(guild)
+            second=await bot.ensure_guild_setup(guild)
+        self.assertIsNone(first[1])
+        self.assertIsNone(second[1])
+        create.assert_awaited_once()
+
+    async def test_setup_forbidden_keeps_existing_binding(self):
+        import guild_config
+        cfg={'forum_channel_id':1,'list_forum_channel_id':2}
+        guild=SimpleNamespace(id=814,get_channel=lambda _:None,fetch_channel=AsyncMock(side_effect=discord.Forbidden(SimpleNamespace(status=403,reason='Forbidden'),'no')))
+        with patch.object(bot,'get_guild_cfg',AsyncMock(return_value=cfg)), patch.object(guild_config,'setup_guild_channels',AsyncMock()) as create:
+            result,error=await bot.ensure_guild_setup(guild)
+        self.assertEqual(result,cfg)
+        self.assertIsNotNone(error)
+        create.assert_not_awaited()
+
+    async def test_restore_old_buttons_edits_once_without_sending(self):
+        state={'threads':{'21':{'rating_message_id':30,'recommend_message_id':31}}}
+        messages={mid:SimpleNamespace(id=mid,author=SimpleNamespace(id=99),edit=AsyncMock()) for mid in (30,31)}
+        channel=SimpleNamespace(fetch_message=AsyncMock(side_effect=lambda mid:messages[mid]),send=AsyncMock())
+        from unittest.mock import Mock
+        client=SimpleNamespace(user=SimpleNamespace(id=99),get_channel=lambda _:channel,add_view=Mock())
+        with patch.object(bot,'read_state_copy',AsyncMock(return_value=state)), patch.object(bot,'_load_state',return_value=state), patch.object(bot,'_write_state'), patch.object(bot.discord,'Thread',SimpleNamespace):
+            await bot.restore_legacy_topic_panels(client)
+            await bot.restore_legacy_topic_panels(client)
+        for message in messages.values():message.edit.assert_awaited_once()
+        channel.send.assert_not_awaited()
+        self.assertEqual(state['threads']['21']['persistent_panels_version'],1)
+
+    async def test_rating_acknowledges_before_panel_request(self):
+        events=[]
+        async def defer(**kwargs):events.append('defer')
+        async def refresh(*args):events.append('refresh')
+        modal=bot.AnimeRatingModal(1)
+        modal.score._value='8'
+        interaction=SimpleNamespace(user=SimpleNamespace(id=2),client=None,response=SimpleNamespace(defer=AsyncMock(side_effect=defer)),followup=SimpleNamespace(send=AsyncMock()))
+        with patch.object(bot,'set_user_rating',AsyncMock()), patch.object(bot,'refresh_rating_panel',AsyncMock(side_effect=refresh)):
+            await modal.on_submit(interaction)
+        self.assertEqual(events,['defer','refresh'])
+
     async def test_retry_429_then_success(self):
         from unittest.mock import Mock
         session = SimpleNamespace(get=Mock(side_effect=[Response(429, headers={'Retry-After':'0'}), Response(200, {'ok':True})]))
@@ -197,6 +245,11 @@ class APITests(unittest.IsolatedAsyncioTestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_owner_requires_id_not_matching_name(self):
+        with patch.dict(os.environ,{'DISCORD_BOT_OWNER_ID':'123'}):
+            self.assertFalse(bot.is_bot_owner(SimpleNamespace(id=999,name=bot.BOT_OWNER_USERNAME)))
+            self.assertTrue(bot.is_bot_owner(SimpleNamespace(id=123,name='renamed')))
+
     def test_corruption_never_becomes_empty_state(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'state.json'
