@@ -2,5 +2,14 @@
 .venv/
 __pycache__/
 *.pyc
-data/mal_state.json
-data/bot.log
+data/*
+!data/.gitkeep
+*.log
+
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+*.log
+*.tmp
+.coverage
