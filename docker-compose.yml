@@ -1,0 +1,15 @@
+services:
+  anime-bot:
+    build: .
+    image: animewutshybot:local
+    container_name: animewutshybot
+    restart: "on-failure:5"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

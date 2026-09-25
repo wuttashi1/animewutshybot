@@ -1,0 +1,17 @@
+# Build from a checkout: docker compose -f docker-compose.casaos.yml up -d --build
+# Store credentials in /DATA/AppData/animewutshybot/.env, chmod 600.
+services:
+  anime-bot:
+    build: .
+    image: animewutshybot:local
+    container_name: animewutshybot
+    restart: "on-failure:5"
+    env_file: /DATA/AppData/animewutshybot/.env
+    volumes:
+      - /DATA/AppData/animewutshybot/data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

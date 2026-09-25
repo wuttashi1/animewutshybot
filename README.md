@@ -2,38 +2,87 @@
 
 # Anime Wutshy Bot
 
-Discord anime community bot with anime cards, forum topics, personal lists and YummyAnime integration.
+**Аниме-каталог и личные списки для Discord — без потока лишних сообщений.**
 
-[Contributing](CONTRIBUTING.md) · [Branches](https://github.com/wuttashi1/animewutshybot/branches)
+[![Tests](https://github.com/wuttashi1/animewutshybot/actions/workflows/tests.yml/badge.svg)](https://github.com/wuttashi1/animewutshybot/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![Discord](https://img.shields.io/badge/Discord-discord.py-5865F2?logo=discord&logoColor=white)
+
+[Установка](#установка) · [Команды](#команды) · [CasaOS](docs/CASAOS.md) · [Изменения](CHANGELOG.md)
 
 </div>
 
----
+## Что умеет бот
 
-## Features
+- Общий форум с карточками аниме, оценками и рекомендациями.
+- Личные списки: компактная сводка, страницы или галерея обложек.
+- Импорт из YummyAnime и публичных списков MyAnimeList; постеры и оценки MAL через Jikan.
+- Настройка каналов для каждого сервера, административная диагностика и поиск дубликатов.
+- Обновление существующих сообщений вместо удаления и повторной публикации всего списка.
 
-- Anime cards backed by external APIs.
-- Forum topics and personal anime lists.
-- Administrative panels, topic updates and duplicate detection.
-- YummyAnime integration and Jikan data fetching.
+Просмотр списка и результаты команд видны только автору запроса. Сами темы форума видны всем, у кого есть доступ к родительскому каналу: это **персональные, а не приватные** списки. Новые сообщения списков отправляются без push-уведомлений и упоминаний. Галерея всё равно создаёт по сообщению на новый тайтл; для больших списков используйте сводку или страницы.
 
-## Quick start
+## Команды
 
-Create and activate a Python virtual environment, then:
+- `/anime add`, `/anime rate` — добавить тайтл и поставить оценку.
+- `/list show`, `/list top` — посмотреть список и выбрать любимые тайтлы.
+- `/mal bind`, `/mal import`, `/mal show` — привязка, импорт и просмотр MAL.
+- `/yummy bind`, `/yummy sync`, `/yummy unbind` — подключение YummyAnime и ручной импорт.
+- `/admin` и `/adminpanel` — настройка сервера и обслуживание каталога.
+- `/bot setup`, `/bot status`, `/bot health` — настройка и диагностика; `/owner` и `/roast` — функции владельца и ручные подколы.
+
+Старые алиасы (`/aa`, `/animeadd`, `/mylist` и другие) скрыты по умолчанию. Для временной совместимости задайте `DISCORD_LEGACY_COMMANDS=1`. Текстовые `!aa` и `!animeadd` требуют Message Content Intent.
+
+## Установка
+
+Нужен Python 3.12+ или Docker. Создайте приложение и бота в [Discord Developer Portal](https://discord.com/developers/applications), пригласите его со scope `bot` и `applications.commands`.
 
 ```bash
+cp .env.example .env
+# Заполните .env собственными ключами.
+docker compose up -d --build
+```
+
+Для запуска без Docker:
+
+```bash
+python -m venv .venv
+# Linux/macOS: source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python bot.py
 ```
 
-Before starting, configure a local `.env` using `.env.example`. The bot reads `DISCORD_BOT_TOKEN`; see the example configuration for integration settings. Configure the application and bot permissions in the Discord Developer Portal.
+Задайте `DISCORD_BOT_TOKEN`. Для YummyAnime создайте приложение на [странице разработчика](https://yummyani.me/dev/applications) и заполните `YUMMY_APPLICATION_TOKEN`. API использует заголовок `X-Application`; привязка пользовательских списков дополнительно требует авторизации пользователя. [Документация YummyAnime](https://api.yani.tv/swagger).
 
-## Project layout
+`DISCORD_GUILD_ID` ограничивает регистрацию команд одним сервером. Пустое значение включает глобальную регистрацию. При смене режима бот удаляет устаревшие копии команд другого уровня. `DISCORD_BOT_OWNER_ID` задаёт владельца служебных команд.
 
-- `bot.py` — Discord commands, panels and forum workflows.
-- `yummy_api.py` — YummyAnime integration.
-- Development versions are available in the repository's branch list. `main` remains the default branch.
+После первого запуска администратор использует `/adminpanel action:setup_channels`. Боту нужны права видеть каналы, читать историю, создавать публичные ветки, отправлять сообщения в ветки, прикреплять файлы, встраивать ссылки и добавлять реакции. Для обслуживания тем нужны Manage Threads; для создания каналов — Manage Channels. Настройте доступ к форумам средствами Discord.
 
-## Development
+## Спокойные настройки по умолчанию
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for branch and contribution guidelines.
+- `YUMMY_BACKGROUND_SYNC=0`: импорт запускается вручную, не создаёт темы неожиданно.
+- `ROASTER_AUTOMATION_ENABLED=0`: автоматические подколы отключены, даже если они включены в старой базе.
+- `DISCORD_MESSAGE_CONTENT_INTENT=0`: для slash-команд привилегированный intent не нужен.
+
+Если сознательно включаете фоновые импорты, задайте `YUMMY_BACKGROUND_SYNC=1`. Интервал — `YUMMY_SYNC_INTERVAL_SEC`, минимум 60 секунд. Импорт создаёт темы в общем каталоге и ограничен числом новых тем за проход. Фон работает для основного сервера и пользователей, доступных в Discord-кэше; ручной импорт надёжнее для больших серверов.
+
+## Обслуживание и проверка
+
+```bash
+python -m unittest discover -s tests -v
+python scripts/command_smoke_test.py
+python scripts/health_check.py
+```
+
+Проверка здоровья выполняет чтение API без регистрации команд и публикации сообщений. API-ошибки завершают проверку ненулевым кодом. Не запускайте второй экземпляр бота с той же базой: JSON-хранилище рассчитано на один процесс. Перед обновлением остановите контейнер и сохраните `data/` и `.env`. Повреждённая база блокирует запись вместо незаметного сброса списков.
+
+Секреты хранятся в `.env`, пользовательские токены — в `data/mal_state.json`; ограничьте доступ и защищайте резервные копии. Токены, ранее попавшие в историю Git, нужно отозвать у провайдера: удаление из текущих файлов не удаляет их из истории.
+
+Скриншоты появятся после проверки интерфейса на сервере. Пока репозиторий не содержит изображений, выдаваемых за работающий интерфейс.
+
+## Разработка
+
+`bot.py` — основной цикл и состояние; `register_commands.py` — команды; `personal_display.py` — списки; `yummy_api.py` и `http_client.py` — интеграции. Проверки регрессий находятся в `tests/`, CI запускает их на Python 3.12–3.14.
+
+[Правила участия](CONTRIBUTING.md) · [Безопасность](SECURITY.md)
