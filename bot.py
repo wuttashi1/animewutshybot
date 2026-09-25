@@ -1530,7 +1530,7 @@ def _build_bot_commands_embed() -> discord.Embed:
         ("**`/admin`**", "скан форума, синк Yummy, ремонт тем, **`roaster_enable`**"),
         ("**`/bot`**", "`setup` · `status` · `health`"),
         ("**`/owner`**", "`off` — глобальный kill-switch «Обзывателя» (владелец бота)"),
-        ("**`/roast`**", "`member` — подкол по команде (+ авто в чате и раз в 1–6 ч)"),
+        ("**`/roast`**", "`member` — подкол по команде. Автоматические сообщения по умолчанию отключены."),
     ]
     for name, desc in rows:
         e.add_field(name=name, value=desc, inline=False)
@@ -1578,6 +1578,25 @@ async def save_guild_cfg(guild_id: int, cfg: dict[str, Any]) -> None:
 
 async def migrate_legacy_guild_config() -> None:
     """Переносит hardcoded/env ID каналов в state[\"guilds\"] при первом запуске."""
+    existing = await read_state_copy()
+    if existing.get("guilds"):
+        return
+    try:
+        expected_guild = int(os.environ.get("DISCORD_GUILD_ID") or 0)
+    except ValueError:
+        return
+    if not expected_guild:
+        return
+    for channel_id in (_legacy_forum_id() or _LEGACY_FORUM_CHANNEL_ID,
+                       _legacy_list_forum_id() or _LEGACY_LIST_FORUM_CHANNEL_ID):
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            logger.info("Legacy forums unavailable; use /bot setup to configure this server")
+            return
+        if not isinstance(channel, discord.ForumChannel) or channel.guild.id != expected_guild:
+            logger.info("Legacy forums belong to a different server; migration skipped")
+            return
     async with _state_lock:
         data = _load_state()
         guilds = data.setdefault("guilds", {})

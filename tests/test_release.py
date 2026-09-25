@@ -116,6 +116,12 @@ class Response:
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_migration_rejects_channels_from_another_guild(self):
+        channel=SimpleNamespace(guild=SimpleNamespace(id=999))
+        with patch.dict(os.environ,{'DISCORD_GUILD_ID':'123'}), patch.object(bot,'read_state_copy',AsyncMock(return_value={'guilds':{}})), patch.object(bot.bot,'get_channel',return_value=channel), patch.object(bot.discord,'ForumChannel',SimpleNamespace), patch.object(bot,'_write_state') as write:
+            await bot.migrate_legacy_guild_config()
+        write.assert_not_called()
+
     async def test_setup_twice_does_not_create_duplicate_forums(self):
         import guild_config
         config={}
